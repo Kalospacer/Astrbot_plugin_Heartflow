@@ -6,10 +6,11 @@
     "hint": "启用后，机器人将智能判断群聊消息并主动回复"
   },
   "judge_provider_name": {
-    "description": "判断模型提供商名称",
+    "description": "判断模型提供商",
     "type": "string",
     "default": "",
-    "hint": "用于小参数模型判断的提供商名称，如配置的OpenAI、Claude等提供商"
+    "hint": "用于小参数模型判断的提供商，建议使用Gemini 2.0 Flash等快速小模型",
+    "_special": "select_provider"
   },
   "reply_threshold": {
     "description": "回复阈值(0-1)",
