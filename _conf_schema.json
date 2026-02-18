@@ -89,5 +89,17 @@
     "type": "int",
     "default": 3,
     "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次"
+  },
+  "judge_context_count": {
+    "description": "传入判断模型的上下文条数",
+    "type": "int",
+    "default": 10,
+    "hint": "传给判断模型的对话历史条数，独立于context_messages_count，建议设置更大的值以提升判断质量"
+  },
+  "min_reply_interval_seconds": {
+    "description": "最短回复间隔（秒）",
+    "type": "int",
+    "default": 0,
+    "hint": "两次心流主动触发之间的最短间隔秒数，0表示不限制，可防止机器人过于频繁发言"
   }
 }

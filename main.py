@@ -1,12 +1,15 @@
 import json
+import re
 import time
 import datetime
+from collections import deque
 from typing import Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import logger
+from astrbot.api.message_components import Plain
 
 
 @dataclass
@@ -29,6 +32,16 @@ class JudgeResult:
 
 
 @dataclass
+class RawMessage:
+    """原始群聊消息条目"""
+    sender_name: str
+    sender_id: str
+    content: str
+    timestamp: float
+    is_bot: bool = False
+
+
+@dataclass
 class ChatState:
     """群聊状态数据类"""
     energy: float = 1.0
@@ -37,6 +50,45 @@ class ChatState:
     total_messages: int = 0
     total_replies: int = 0
 
+
+def _extract_json(text: str) -> dict:
+    """从模型返回的文本中稳健地提取 JSON 对象。
+
+    依次尝试：
+    1. 直接解析
+    2. 去除 markdown 代码块后解析
+    3. 正则提取第一个 {...} 子串后解析
+    """
+    text = text.strip()
+
+    # 1. 直接尝试
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. 去除 markdown 代码块
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. 正则提取最外层 {...}
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+
+    raise ValueError(f"无法从文本中提取有效 JSON: {text[:200]}")
+
+
+def _clamp_score(v) -> float:
+    """将模型返回的分数值钉位到 [0, 10]。"""
+    try:
+        return max(0.0, min(10.0, float(v)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class HeartflowPlugin(star.Star):
@@ -53,12 +105,19 @@ class HeartflowPlugin(star.Star):
         self.energy_decay_rate = self.config.get("energy_decay_rate", 0.1)
         self.energy_recovery_rate = self.config.get("energy_recovery_rate", 0.02)
         self.context_messages_count = self.config.get("context_messages_count", 5)
+        self.judge_context_count = self.config.get("judge_context_count", self.context_messages_count)
+        self.min_reply_interval = self.config.get("min_reply_interval_seconds", 0)
         self.whitelist_enabled = self.config.get("whitelist_enabled", False)
         self.chat_whitelist = self.config.get("chat_whitelist", [])
 
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
-        
+
+        # 原始群聊消息缓冲区：{unified_msg_origin: deque[RawMessage]}
+        # 记录所有群聊原始消息（无论是否触发 LLM），用于判断上下文
+        self._raw_msg_buffer: Dict[str, deque] = {}
+        self._raw_msg_buffer_size = max(self.context_messages_count, self.judge_context_count) * 4  # 缓冲区保留更多条以备用
+
         # 系统提示词缓存：{conversation_id: {"original": str, "summarized": str, "persona_id": str}}
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
 
@@ -92,12 +151,13 @@ class HeartflowPlugin(star.Star):
             if not curr_cid:
                 return original_prompt
             
-            # 获取当前人格ID作为缓存键的一部分
+            # 获取当前人格ID作为缓存键（仅用 persona_id，不包含 cid）
+            # cid 随对话切换会变，但提示词是按人格存的，缓存键不应包含 cid
             conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            persona_id = conversation.persona_id if conversation else "default"
-            
+            persona_id = (conversation.persona_id if conversation else None) or "default"
+
             # 构建缓存键
-            cache_key = f"{curr_cid}_{persona_id}"
+            cache_key = persona_id
             
             # 检查缓存
             if cache_key in self.system_prompt_cache:
@@ -120,8 +180,8 @@ class HeartflowPlugin(star.Star):
                 "summarized": summarized_prompt,
                 "persona_id": persona_id
             }
-            
-            logger.info(f"创建新的精简系统提示词: {cache_key} | 原长度:{len(original_prompt)} -> 新长度:{len(summarized_prompt)}")
+
+            logger.info(f"创建新的精简系统提示词: [{cache_key}] | 原长度:{len(original_prompt)} -> 新长度:{len(summarized_prompt)}")
             return summarized_prompt
             
         except Exception as e:
@@ -160,21 +220,16 @@ class HeartflowPlugin(star.Star):
             
             # 尝试提取JSON
             try:
-                if content.startswith("```json"):
-                    content = content.replace("```json", "").replace("```", "").strip()
-                elif content.startswith("```"):
-                    content = content.replace("```", "").strip()
-
-                result_data = json.loads(content)
+                result_data = _extract_json(content)
                 summarized = result_data.get("summarized_persona", "")
-                
+
                 if summarized and len(summarized.strip()) > 10:
                     return summarized.strip()
                 else:
                     logger.warning("小模型返回的总结内容为空或过短")
                     return original_prompt
-                    
-            except json.JSONDecodeError:
+
+            except (json.JSONDecodeError, ValueError):
                 logger.error(f"小模型总结系统提示词返回非有效JSON: {content}")
                 return original_prompt
                 
@@ -211,9 +266,9 @@ class HeartflowPlugin(star.Star):
         logger.debug(f"小参数模型使用精简人格提示词: {'有' if persona_system_prompt else '无'} | 长度: {len(persona_system_prompt) if persona_system_prompt else 0}")
 
         # 构建判断上下文
-        chat_context = await self._build_chat_context(event)
-        recent_messages = await self._get_recent_messages(event)
-        last_bot_reply = await self._get_last_bot_reply(event)  # 新增：获取上次bot回复
+        chat_context = self._build_chat_context(event)
+        recent_messages = self._get_recent_messages(event)
+        last_bot_reply = self._get_last_bot_reply(event)
 
         reasoning_part = ""
         if self.judge_include_reasoning:
@@ -287,9 +342,6 @@ class HeartflowPlugin(star.Star):
 """
 
         try:
-            # 使用 provider 调用模型，传入最近的对话历史作为上下文
-            recent_contexts = await self._get_recent_contexts(event)
-
             # 构建完整的判断提示词，将系统提示直接整合到prompt中
             complete_judge_prompt = "你是一个专业的群聊回复决策系统，能够准确判断消息价值和回复时机。"
             if persona_system_prompt:
@@ -297,39 +349,38 @@ class HeartflowPlugin(star.Star):
             complete_judge_prompt += "\n\n**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**\n\n"
             complete_judge_prompt += judge_prompt
 
+            # 提前计算对话历史上下文（循环外只算一次）
+            recent_contexts = self._get_buffered_history(
+                event.unified_msg_origin,
+                n=self.judge_context_count,
+                exclude_last_content=event.message_str,
+                as_dict=True,
+            )
+
             # 重试机制：使用配置的重试次数
-            max_retries = self.judge_max_retries + 1  # 配置的次数+原始尝试=总尝试次数
-            
-            # 如果配置的重试次数为0，只尝试一次
+            max_retries = self.judge_max_retries + 1
             if self.judge_max_retries == 0:
                 max_retries = 1
-            
+
             for attempt in range(max_retries):
                 try:
-                    logger.debug(f"小参数模型判断尝试 {attempt + 1}/{max_retries}")
-                    
                     llm_response = await judge_provider.text_chat(
                         prompt=complete_judge_prompt,
-                        contexts=recent_contexts  # 传入最近的对话历史
+                        contexts=recent_contexts,
+                        image_urls=[],
                     )
 
                     content = llm_response.completion_text.strip()
                     logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
 
-                    # 尝试提取JSON
-                    if content.startswith("```json"):
-                        content = content.replace("```json", "").replace("```", "").strip()
-                    elif content.startswith("```"):
-                        content = content.replace("```", "").strip()
+                    judge_data = _extract_json(content)
 
-                    judge_data = json.loads(content)
-
-                    # 直接从JSON根对象获取分数
-                    relevance = judge_data.get("relevance", 0)
-                    willingness = judge_data.get("willingness", 0)
-                    social = judge_data.get("social", 0)
-                    timing = judge_data.get("timing", 0)
-                    continuity = judge_data.get("continuity", 0)
+                    # 直接从 JSON 根对象获取分数，并钉位到 [0, 10]
+                    relevance = _clamp_score(judge_data.get("relevance", 0))
+                    willingness = _clamp_score(judge_data.get("willingness", 0))
+                    social = _clamp_score(judge_data.get("social", 0))
+                    timing = _clamp_score(judge_data.get("timing", 0))
+                    continuity = _clamp_score(judge_data.get("continuity", 0))
                     
                     # 计算综合评分
                     overall_score = (
@@ -358,7 +409,7 @@ class HeartflowPlugin(star.Star):
                         related_messages=[]  # 不再使用关联消息功能
                     )
                     
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"小参数模型返回JSON解析失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
                     logger.warning(f"无法解析的内容: {content[:500]}...")
                     
@@ -378,6 +429,23 @@ class HeartflowPlugin(star.Star):
             logger.error(f"小参数模型判断异常: {e}")
             return JudgeResult(should_reply=False, reasoning=f"异常: {str(e)}")
 
+    def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> None:
+        """将消息写入原始消息缓冲区"""
+        umo = event.unified_msg_origin
+        if umo not in self._raw_msg_buffer:
+            self._raw_msg_buffer[umo] = deque(maxlen=self._raw_msg_buffer_size)
+        self._raw_msg_buffer[umo].append(RawMessage(
+            sender_name=event.get_sender_name(),
+            sender_id=str(event.get_sender_id()),
+            content=event.message_str,
+            timestamp=time.time(),
+            is_bot=is_bot,
+        ))
+
+    def _get_raw_buffer(self, umo: str) -> list[RawMessage]:
+        """获取缓冲区中的消息列表（时间顺序）"""
+        return list(self._raw_msg_buffer.get(umo, []))
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
         """群聊消息处理入口"""
@@ -385,6 +453,9 @@ class HeartflowPlugin(star.Star):
         # 检查基本条件
         if not self._should_process_message(event):
             return
+
+        # 第一时间记录原始消息，无论是否最终触发 LLM
+        self._record_raw_message(event, is_bot=False)
 
         try:
             # 小参数模型判断是否需要回复
@@ -395,7 +466,9 @@ class HeartflowPlugin(star.Star):
 
                 # 设置唤醒标志为真，调用LLM
                 event.is_at_or_wake_command = True
-                
+                # 标记为心流触发，供 on_llm_request 钉入角色提示
+                event.set_extra("heartflow_triggered", True)
+
                 # 更新主动回复状态
                 self._update_active_state(event, judge_result)
                 logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
@@ -411,6 +484,45 @@ class HeartflowPlugin(star.Star):
             logger.error(f"心流插件处理消息异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """在消息发送后将机器人的回复写入原始消息缓冲区，以便后续判断参考"""
+        if not self.config.get("enable_heartflow", False):
+            return
+
+        result = event.get_result()
+        if result is None or not result.chain:
+            return
+
+        # 提取回复的纯文本内容
+        reply_text = "".join(
+            comp.text for comp in result.chain if isinstance(comp, Plain)
+        ).strip()
+        if not reply_text:
+            return
+
+        umo = event.unified_msg_origin
+        if umo not in self._raw_msg_buffer:
+            self._raw_msg_buffer[umo] = deque(maxlen=self._raw_msg_buffer_size)
+        self._raw_msg_buffer[umo].append(RawMessage(
+            sender_name="bot",
+            sender_id="bot",
+            content=reply_text,
+            timestamp=time.time(),
+            is_bot=True,
+        ))
+        logger.debug(f"机器人回复已写入缓冲区: {umo[:20]}... | {reply_text[:40]}...")
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req):
+        """心流触发时，在 LLM 请求前注入一条提示，让大模型知道自己是主动参与群聊的"""
+        if not event.get_extra("heartflow_triggered"):
+            return
+        if not req or not hasattr(req, "system_prompt"):
+            return
+        note = "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）"
+        req.system_prompt = (req.system_prompt or "") + "\n" + note
 
     def _should_process_message(self, event: AstrMessageEvent) -> bool:
         """检查是否应该处理这条消息"""
@@ -442,6 +554,14 @@ class HeartflowPlugin(star.Star):
         if not event.message_str or not event.message_str.strip():
             return False
 
+        # 冷却时间校验：防止短时间内连续触发
+        if self.min_reply_interval > 0:
+            minutes = self._get_minutes_since_last_reply(event.unified_msg_origin)
+            elapsed_seconds = minutes * 60
+            if elapsed_seconds < self.min_reply_interval:
+                logger.debug(f"冷却中，距上次回复还有 {self.min_reply_interval - elapsed_seconds:.0f}s")
+                return False
+
         return True
 
     def _get_chat_state(self, chat_id: str) -> ChatState:
@@ -455,8 +575,15 @@ class HeartflowPlugin(star.Star):
 
         if state.last_reset_date != today:
             state.last_reset_date = today
-            # 每日重置时恢复一些精力
+            # 每日重置时恒复一些精力
             state.energy = min(1.0, state.energy + 0.2)
+
+        # 基于时间流逝自然恢复精力（距上次回复每过 5 分钟回复 1% 精力）
+        if state.last_reply_time > 0:
+            elapsed_minutes = (time.time() - state.last_reply_time) / 60.0
+            time_recovery = elapsed_minutes * (self.energy_recovery_rate * 5)
+            state.energy = min(1.0, state.energy + time_recovery)
+            state.last_reply_time = time.time()  # 重置计时起点，避免重复累加
 
         return state
 
@@ -469,46 +596,23 @@ class HeartflowPlugin(star.Star):
 
         return int((time.time() - chat_state.last_reply_time) / 60)
 
-    async def _get_recent_contexts(self, event: AstrMessageEvent) -> list:
-        """获取最近的对话上下文（用于传递给小参数模型）
-        
-        注意：此方法会过滤掉函数调用相关内容，只保留纯文本消息，
-        以避免小参数模型因不支持函数调用而报错。
+    def _get_recent_contexts(self, event: AstrMessageEvent) -> list:
+        """从原始消息缓冲区获取最近对话上下文（用于传递给小参数模型）。
+
+        使用本地缓冲区而非 conversation_manager，以便包含所有群聊消息，
+        而不仅仅是触发过 LLM 的消息。
         """
-        try:
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                return []
+        msgs = self._get_raw_buffer(event.unified_msg_origin)
+        # 排除当前这条消息（已被 _record_raw_message 写入），取之前的若干条
+        if msgs and msgs[-1].content == event.message_str:
+            msgs = msgs[:-1]
+        recent = msgs[-self.context_messages_count:] if len(msgs) > self.context_messages_count else msgs
 
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation or not conversation.history:
-                return []
-
-            context = json.loads(conversation.history)
-
-            # 获取最近的 context_messages_count 条消息
-            recent_context = context[-self.context_messages_count:] if len(context) > self.context_messages_count else context
-
-            # 过滤掉函数调用相关内容，避免小参数模型报错
-            filtered_context = []
-            for msg in recent_context:
-                # 只保留纯文本的用户和助手消息
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                
-                if role in ["user", "assistant"] and content and isinstance(content, str):
-                    # 创建一个干净的消息副本，只包含文本内容
-                    clean_msg = {
-                        "role": role,
-                        "content": content
-                    }
-                    filtered_context.append(clean_msg)
-
-            return filtered_context
-
-        except Exception as e:
-            logger.debug(f"获取对话上下文失败: {e}")
-            return []
+        contexts = []
+        for m in recent:
+            role = "assistant" if m.is_bot else "user"
+            contexts.append({"role": role, "content": m.content})
+        return contexts
 
     async def _build_chat_context(self, event: AstrMessageEvent) -> str:
         """构建群聊上下文"""
@@ -519,61 +623,61 @@ class HeartflowPlugin(star.Star):
 当前时间: {datetime.datetime.now().strftime('%H:%M')}"""
         return context_info
 
-    async def _get_recent_messages(self, event: AstrMessageEvent) -> str:
-        """获取最近的消息历史（用于小参数模型判断）"""
-        try:
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                return "暂无对话历史"
+    def _get_recent_messages(self, event: AstrMessageEvent) -> str:
+        """从原始消息缓冲区获取最近的消息历史（用于小参数模型判断）。
 
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation or not conversation.history:
-                return "暂无对话历史"
+        包含所有群聊成员的消息，而非仅 LLM 处理过的消息。
+        """
+        msgs = self._get_raw_buffer(event.unified_msg_origin)
+        # 排除当前这条消息（已被 _record_raw_message 写入），取之前的若干条
+        if msgs and msgs[-1].content == event.message_str:
+            msgs = msgs[:-1]
+        recent = msgs[-self.context_messages_count:] if len(msgs) > self.context_messages_count else msgs
 
-            context = json.loads(conversation.history)
-
-            # 获取最近的 context_messages_count 条消息
-            recent_context = context[-self.context_messages_count:] if len(context) > self.context_messages_count else context
-
-            # 直接返回原始的对话历史，让小参数模型自己判断
-            messages_text = []
-            for msg in recent_context:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                if role in ["user", "assistant"]:
-                    messages_text.append(content)
-
-            return "\n---\n".join(messages_text) if messages_text else "暂无对话历史"
-
-        except Exception as e:
-            logger.debug(f"获取消息历史失败: {e}")
+        if not recent:
             return "暂无对话历史"
 
-    async def _get_last_bot_reply(self, event: AstrMessageEvent) -> str:
-        """获取上次机器人的回复消息"""
-        try:
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                return None
+        lines = []
+        for m in recent:
+            prefix = "[机器人]" if m.is_bot else f"[{m.sender_name}]"
+            lines.append(f"{prefix}: {m.content}")
+        return "\n".join(lines)
 
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation or not conversation.history:
-                return None
+    def _get_last_bot_reply(self, event: AstrMessageEvent) -> str | None:
+        """从原始消息缓冲区获取上次机器人的回复内容。"""
+        msgs = self._get_raw_buffer(event.unified_msg_origin)
+        for m in reversed(msgs):
+            if m.is_bot and m.content.strip():
+                return m.content
+        return None
 
-            context = json.loads(conversation.history)
+    def _build_chat_context(self, event: AstrMessageEvent) -> str:
+        """构建群聊上下文摘要信息。"""
+        chat_state = self._get_chat_state(event.unified_msg_origin)
 
-            # 从后往前查找最后一条assistant消息
-            for msg in reversed(context):
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                if role == "assistant" and content.strip():
-                    return content
+        # 检查上次机器人回复后群里有没有人接话（评估回复质量）
+        msgs = self._get_raw_buffer(event.unified_msg_origin)
+        post_reply_engagement = ""
+        found_bot = False
+        user_msgs_after_bot = 0
+        for m in reversed(msgs):
+            if m.is_bot:
+                found_bot = True
+                break
+            user_msgs_after_bot += 1
+        if found_bot:
+            if user_msgs_after_bot >= 3:
+                post_reply_engagement = "（上次回复后群里进行了热烈讨论）"
+            elif user_msgs_after_bot == 0:
+                post_reply_engagement = "（上次回复后无人接话）"
 
-            return None
-
-        except Exception as e:
-            logger.debug(f"获取上次bot回复失败: {e}")
-            return None
+        context_info = (
+            f"最近活跃度: {'\u9ad8' if chat_state.total_messages > 100 else '\u4e2d' if chat_state.total_messages > 20 else '\u4f4e'}\n"
+            f"历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%\n"
+            f"当前时间: {datetime.datetime.now().strftime('%H:%M')}"
+            + (f"\n回复效果: {post_reply_engagement}" if post_reply_engagement else "")
+        )
+        return context_info
 
     def _update_active_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
         """更新主动回复状态"""
@@ -647,6 +751,7 @@ class HeartflowPlugin(star.Star):
         event.set_result(event.plain_result(status_info))
 
     # 管理员命令：重置心流状态
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_reset")
     async def heartflow_reset(self, event: AstrMessageEvent):
         """重置心流状态"""
@@ -659,6 +764,7 @@ class HeartflowPlugin(star.Star):
         logger.info(f"心流状态已重置: {chat_id}")
 
     # 管理员命令：查看系统提示词缓存
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_cache")
     async def heartflow_cache_status(self, event: AstrMessageEvent):
         """查看系统提示词缓存状态"""
@@ -683,6 +789,7 @@ class HeartflowPlugin(star.Star):
         event.set_result(event.plain_result(cache_info))
 
     # 管理员命令：清除系统提示词缓存
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("heartflow_cache_clear")
     async def heartflow_cache_clear(self, event: AstrMessageEvent):
         """清除系统提示词缓存"""
@@ -696,46 +803,32 @@ class HeartflowPlugin(star.Star):
     async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
         """获取当前对话的人格系统提示词"""
         try:
-            # 获取当前对话
+            persona_mgr = self.context.persona_manager
+
+            # 获取当前对话，尝试拿到会话绑定的 persona_id
             curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            if not curr_cid:
-                # 如果没有对话ID，使用默认人格
-                default_persona_name = self.context.provider_manager.selected_default_persona["name"]
-                return self._get_persona_prompt_by_name(default_persona_name)
+            persona_id: str | None = None
+            if curr_cid:
+                conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
+                if conversation:
+                    persona_id = conversation.persona_id
 
-            conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-            if not conversation:
-                # 如果没有对话对象，使用默认人格
-                default_persona_name = self.context.provider_manager.selected_default_persona["name"]
-                return self._get_persona_prompt_by_name(default_persona_name)
-
-            # 获取人格ID
-            persona_id = conversation.persona_id
-
-            if not persona_id:
-                # persona_id 为 None 时，使用默认人格
-                persona_id = self.context.provider_manager.selected_default_persona["name"]
-            elif persona_id == "[%None]":
-                # 用户显式取消人格时，不使用任何人格
+            # 用户显式取消人格
+            if persona_id == "[%None]":
                 return ""
 
-            return self._get_persona_prompt_by_name(persona_id)
+            if persona_id:
+                # 直接通过 PersonaManager 查询数据库
+                try:
+                    persona = await persona_mgr.get_persona(persona_id)
+                    return persona.system_prompt or ""
+                except ValueError:
+                    logger.debug(f"未找到人格 {persona_id}，回退到默认人格")
+
+            # 无 persona_id 或查询失败，使用默认人格
+            default_persona = await persona_mgr.get_default_persona_v3(event.unified_msg_origin)
+            return default_persona.get("prompt", "")
 
         except Exception as e:
             logger.debug(f"获取人格系统提示词失败: {e}")
-            return ""
-
-    def _get_persona_prompt_by_name(self, persona_name: str) -> str:
-        """根据人格名称获取人格提示词"""
-        try:
-            # 从provider_manager中查找人格
-            for persona in self.context.provider_manager.personas:
-                if persona["name"] == persona_name:
-                    return persona.get("prompt", "")
-
-            logger.debug(f"未找到人格: {persona_name}")
-            return ""
-
-        except Exception as e:
-            logger.debug(f"获取人格提示词失败: {e}")
             return ""
