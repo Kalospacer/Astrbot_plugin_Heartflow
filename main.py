@@ -671,12 +671,20 @@ class HeartflowPlugin(star.Star):
             elif user_msgs_after_bot == 0:
                 post_reply_engagement = "（上次回复后无人接话）"
 
-        context_info = (
-            f"最近活跃度: {'\u9ad8' if chat_state.total_messages > 100 else '\u4e2d' if chat_state.total_messages > 20 else '\u4f4e'}\n"
-            f"历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%\n"
-            f"当前时间: {datetime.datetime.now().strftime('%H:%M')}"
-            + (f"\n回复效果: {post_reply_engagement}" if post_reply_engagement else "")
-        )
+        if chat_state.total_messages > 100:
+            activity_level = "高"
+        elif chat_state.total_messages > 20:
+            activity_level = "中"
+        else:
+            activity_level = "低"
+
+        context_info = f"最近活跃度: {activity_level}\n"
+        context_info += f"历史回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%\n"
+        context_info += f"当前时间: {datetime.datetime.now().strftime('%H:%M')}"
+
+        if post_reply_engagement:
+            context_info += f"\n回复效果: {post_reply_engagement}"
+            
         return context_info
 
     def _update_active_state(self, event: AstrMessageEvent, judge_result: JudgeResult):
