@@ -461,7 +461,7 @@ class HeartflowPlugin(star.Star):
         return [{"role": ("assistant" if m.is_bot else "user"), "content": m.content} for m in msgs]
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
-    async def on_group_message(self, event: AstrMessageEvent):
+    async def on_group_message(self, event: AstrMessageEvent, *args, **kwargs):
         """群聊消息处理入口"""
 
         # 检查基本条件
