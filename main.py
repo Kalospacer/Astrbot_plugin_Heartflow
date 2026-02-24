@@ -445,6 +445,20 @@ class HeartflowPlugin(star.Star):
     def _get_raw_buffer(self, umo: str) -> list[RawMessage]:
         """获取缓冲区中的消息列表（时间顺序）"""
         return list(self._raw_msg_buffer.get(umo, []))
+    def _get_buffered_history(self, umo: str, n: int = 10, exclude_last_content: str | None = None, as_dict: bool = False):
+        """Compatibility shim for historical calls using local raw-message buffer."""
+        msgs = self._get_raw_buffer(umo)
+
+        if exclude_last_content and msgs and msgs[-1].content == exclude_last_content:
+            msgs = msgs[:-1]
+
+        if n > 0 and len(msgs) > n:
+            msgs = msgs[-n:]
+
+        if not as_dict:
+            return msgs
+
+        return [{"role": ("assistant" if m.is_bot else "user"), "content": m.content} for m in msgs]
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
