@@ -396,13 +396,28 @@ class HeartflowPlugin(star.Star):
 
                     logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
 
+                    reasoning_text = judge_data.get("reasoning", "") if self.judge_include_reasoning else ""
+                    logger.info(
+                        "Heartflow judge | chat=%s | rel=%.1f will=%.1f soc=%.1f time=%.1f cont=%.1f | overall=%.3f threshold=%.3f | reply=%s | reason=%s",
+                        event.unified_msg_origin,
+                        relevance,
+                        willingness,
+                        social,
+                        timing,
+                        continuity,
+                        overall_score,
+                        self.reply_threshold,
+                        should_reply,
+                        (reasoning_text[:200] + "...") if reasoning_text and len(reasoning_text) > 200 else reasoning_text,
+                    )
+
                     return JudgeResult(
                         relevance=relevance,
                         willingness=willingness,
                         social=social,
                         timing=timing,
                         continuity=continuity,
-                        reasoning=judge_data.get("reasoning", "") if self.judge_include_reasoning else "",
+                        reasoning=reasoning_text,
                         should_reply=should_reply,
                         confidence=overall_score,  # 使用综合评分作为置信度
                         overall_score=overall_score,
