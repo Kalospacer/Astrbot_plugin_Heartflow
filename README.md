@@ -1,137 +1,123 @@
-# 心流插件 (Heartflow)
+# Heartflow 插件使用文档
 
-基于双LLM架构设计的简单心流模式智能群聊主动回复系统
+本插件是“接管版群聊记忆 + Heartflow 主动回复”单插件方案。
 
-## 🌟 功能特色
+它做两件事：
+1. 接管群聊上下文记忆（含图片记忆策略）。
+2. 用小模型判断是否主动回复，并触发主模型回复。
 
-- **智能判断**：使用小参数模型快速判断是否需要回复群聊消息
-- **高质量回复**：使用AstrBot配置的大型LLM生成自然流畅的回复
-- **群聊隔离**：每个群聊独立的状态管理和精力系统
-- **频率控制**：智能控制回复频率，避免过度活跃
-- **配置灵活**：支持多种参数调节，适应不同群聊环境
+## 核心行为
 
-## 🏗️ 架构设计
+1. 首次出现的图片：必须原生进入 `req.image_urls`（多模态直读）。
+2. 第二次及以后：走文本记忆，格式为 `[Image]` 或 `[Image: xxx]`。
+3. 主动回复：只由 Heartflow 评分触发，不走随机兜底。
 
-```
-判断小模型 (用户配置) → 快速决策 → 大型回复模型 (AstrBot现有配置) → 高质量回复
-```
+## 重要前置设置
 
-## 🏗️ 推荐使用模型
+为了避免原版和插件双重注入，建议关闭 AstrBot 内置 LTM 两个开关：
 
-Gemma 27b，可在Google Aistudio获取密钥后使用，每天免费14400次，基本满足需求
+1. `provider_ltm_settings.group_icl_enable = false`
+2. `provider_ltm_settings.active_reply.enable = false`
 
-### 判断维度
-1. **内容相关度** (0-10)：消息是否有价值、有趣、适合回复
-2. **回复意愿** (0-10)：基于当前精力状态的回复意愿
-3. **社交适宜性** (0-10)：回复是否符合群聊氛围
-4. **时机恰当性** (0-10)：考虑频率控制和时间间隔
+如果你没关，本插件会 `WARN` 提示，但不会阻断运行。
 
-## ⚙️ 配置说明
+## 安装与启用
 
-### 必要配置
-1. **启用插件**：`enable_heartflow = true`
-2. **小参数判断模型配置**：`judge_provider_name`：在AstrBot中配置的提供商名称
+1. 将插件放到 AstrBot 插件目录并加载。
+2. 在插件配置里至少设置：
+   - `enable_heartflow = true`
+   - `judge_provider_name = <你的判断模型提供商ID>`
+3. 如需接管群聊记忆，确保：
+   - `enable_group_context = true`（默认即 true）
+4. 重启 AstrBot。
 
-### 可选配置
-- `reply_threshold`：回复阈值 (0-1，默认0.6)
-- `energy_decay_rate`：精力衰减速度 (默认0.1)
-- `energy_recovery_rate`：精力恢复速度 (默认0.02)
-- `context_messages_count`：上下文消息数量 (默认5)
+## 配置说明
+
+### 群聊记忆接管配置
+
+- `enable_group_context`：启用群聊上下文接管（默认 `true`）
+- `group_message_max_cnt`：群聊记忆最大消息数（默认 `300`）
+- `history_message_window`：图片候选扫描窗口（默认 `5`）
+- `max_native_images_per_round`：每轮最多原生注入图片数（默认 `2`）
+- `pending_max_wait_rounds`：待注入图片最大等待轮数（默认 `2`）
+- `image_caption`：复见图片是否转述成 `[Image: xxx]`（默认 `false`）
+- `image_caption_provider_id`：图片转述模型提供商 ID（默认空）
+- `image_caption_prompt`：图片转述提示词
+
+### Heartflow 主动回复配置
+
+- `enable_heartflow`：启用主动回复（默认 `false`）
+- `judge_provider_name`：判断模型提供商 ID（必填）
+- `reply_threshold`：主动回复阈值（默认 `0.6`）
+- `min_reply_interval_seconds`：最短主动回复间隔秒数（默认 `0`）
+- `context_messages_count`：判断模型使用的历史条数（默认 `5`）
+- `judge_context_count`：传给判断模型的上下文条数（默认 `10`）
+- `judge_max_retries`：判断 JSON 解析失败重试次数（默认 `3`）
+- `judge_include_reasoning`：是否输出判断理由（默认 `true`）
 
 ### 白名单配置
-- `whitelist_enabled`：启用群聊白名单 (默认false)
-- `chat_whitelist`：群聊白名单列表 (默认[])
 
-#### 白名单使用说明
-当启用白名单模式时，只有在白名单中的群聊才会触发心流回复：
+- `whitelist_enabled`：启用白名单（默认 `false`）
+- `chat_whitelist`：允许触发主动回复的会话 SID 列表
 
+## 管理命令
 
+- `/heartflow`：查看当前会话状态（含记忆接管状态）
+- `/heartflow_reset`：清空当前会话状态（主动回复状态 + 图片记忆状态）
+- `/heartflow_cache`：查看系统提示词缓存
+- `/heartflow_cache_clear`：清除系统提示词缓存
 
-获取群聊ID的方法：
-1. 在目标群聊中发送 `/sid` 命令
-2. 查看返回的状态报告，复制显示的sid
-3. 将完整的ID添加到白名单配置中
+## 工作机制（图片相关）
 
-## 🚀 使用指南
+1. `on_group_message`
+   - 记录群聊结构化消息（文本/At/图片）。
+   - 再进行 Heartflow 主动回复判断。
 
-### 1. 安装配置
-1. 将插件放置在 `packages/heartflow/` 目录
-2. 重启AstrBot加载插件
-3. 在插件配置中设置判断模型提供商名称
-4. 启用插件：`enable_heartflow = true`
-5. 可选：配置群聊白名单限制插件作用范围
+2. `on_llm_request`
+   - 注入群聊历史文本。
+   - 从最近 `history_message_window` 条消息提取图片。
+   - 执行注入策略：
+     - 每轮最多注入 `max_native_images_per_round` 张未见图片。
+     - `pending` 与 `new` 各占配额，奇数额外名额给 `pending`。
+     - 超过 `pending_max_wait_rounds` 的待注入图片淘汰。
 
+3. `on_llm_response`
+   - 仅在响应后将本轮注入图片标记为 `seen`。
+   - 若启用 `image_caption`，异步生成摘要。
 
-### 2. 管理命令
-- `/heartflow`：查看当前群聊的心流状态
-- `/heartflow_reset`：重置当前群聊的心流状态
+## 快速验证
 
-## 📊 状态说明
+按以下顺序验证最关键路径：
 
-### 精力系统
-- **精力值范围**：0.1 - 1.0
-- **消耗机制**：每次主动回复后精力下降
-- **恢复机制**：不回复时精力缓慢恢复，每日重置时额外恢复
+1. 群里先发图片，再发唤醒词：
+   - 预期：首轮图片进入 `image_urls`。
+2. 下一轮继续聊同图：
+   - 预期：不再原生注入，历史显示 `[Image]` 或 `[Image: xxx]`。
+3. 同一窗口多图：
+   - 预期：遵循每轮上限和 pending 淘汰规则。
 
-## 🔧 高级配置
+建议关注日志：
 
-### 权重调整
-插件内置权重配置：
-```python
-weights = {
-    "relevance": 0.3,      # 内容相关度权重
-    "willingness": 0.25,   # 回复意愿权重  
-    "social": 0.25,        # 社交适宜性权重
-    "timing": 0.2          # 时机恰当性权重
-}
-```
+- `Heartflow judge | ...`：主动回复评分结果
+- `Heartflow LTM | chat=... | inject=... pending=... dropped=...`：图片注入决策
+- `Heartflow LTM 接管模式检测到原版开关仍开启...`：原版冲突告警
 
-### 群聊个性化
-可以通过修改代码实现不同群聊的个性化配置：
-- 技术群：提高相关度权重
-- 闲聊群：提高社交适宜性权重
-- 工作群：提高时机恰当性权重
+## 常见问题
 
-## 📈 监控建议
+1. 群聊看不到图，但私聊能看
+   - 检查是否命中了“首轮原生注入”路径（看 `Heartflow LTM` 日志中的 `inject`）。
+   - 检查 `max_native_images_per_round` 是否过小。
 
-1. **观察回复质量**：调整回复阈值
-2. **监控回复频率**：调整精力参数和时间间隔
-3. **分析判断日志**：优化判断提示词
-4. **收集用户反馈**：持续改进回复策略
+2. 图片一直是 `[Image]`，没有 `[Image: xxx]`
+   - 确认 `image_caption = true`
+   - 确认 `image_caption_provider_id` 已配置且可用
 
-## 🔍 故障排除
+3. 主动回复不触发
+   - 确认 `enable_heartflow = true`
+   - 确认 `judge_provider_name` 有效
+   - 检查白名单是否限制了当前会话
+   - 检查 `reply_threshold` 是否过高
 
-### 常见问题
-1. **不回复任何消息**
-   - 检查判断模型提供商配置是否正确
-   - 确认插件已启用
-   - 检查是否启用了白名单但当前群聊不在白名单中
-   - 查看日志中的错误信息
-
-2. **回复过于频繁**
-   - 提高回复阈值
-   - 减少每日最大回复数
-   - 增加精力衰减速度
-
-3. **回复质量不佳**
-   - 检查AstrBot的LLM配置
-   - 优化判断提示词
-   - 调整权重配置
-
-4. **特定群聊不回复**
-   - 检查白名单配置是否正确
-   - 确认群聊ID是否在白名单中
-   - 查看debug日志确认过滤原因
-
-### 日志信息
-- `💖 心流主动回复`：成功回复的日志
-- `心流判断通过但被最终检查拦截`：判断通过但被频率控制拦截
-- `更新主动状态/被动状态`：状态更新日志
-
-## 🤝 贡献
-
-欢迎提交Issue和Pull Request来改进这个插件！
-
-## 📄 许可证
-
-本插件遵循AstrBot的开源许可证。
+4. 出现 handler 参数不匹配报错
+   - 当前版本的 `on_llm_request/on_llm_response/on_group_message` 已使用兼容签名（含 `*args, **kwargs`）。
+   - 若仍报错，确认运行的是最新插件代码。
