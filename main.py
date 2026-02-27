@@ -1078,6 +1078,23 @@ class HeartflowPlugin(star.Star):
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent):
         """在消息发送后将机器人的回复写入原始消息缓冲区，以便后续判断参考"""
+        clean_session = event.get_extra("_clean_ltm_session", False)
+        if clean_session:
+            chat_id = event.unified_msg_origin
+            if chat_id in self.chat_states:
+                del self.chat_states[chat_id]
+            if chat_id in self._raw_msg_buffer:
+                del self._raw_msg_buffer[chat_id]
+            cleared = self.group_memory.clear_session(chat_id)
+            logger.info(
+                "[%s] 已清空 Heartflow 会话上下文（/reset 或 /new）: records=%d, seen_images=%d, pending=%d",
+                chat_id,
+                cleared["records"],
+                cleared["seen_images"],
+                cleared["pending"],
+            )
+            return
+
         if not self.config.get("enable_heartflow", False):
             return
 
