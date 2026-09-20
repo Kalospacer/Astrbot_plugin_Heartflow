@@ -626,15 +626,15 @@ class HeartflowPlugin(star.Star):
             "willingness": {
                 "type": "score",
                 "instructions": (
-                    "Given the bot's current energy (bot_energy, 0-1) and persona, "
-                    "how willing would the bot be to join this conversation right now?"
+                    "Setting aside the bot's energy level (which the application handles separately), "
+                    "how much would this persona want to participate in this particular topic?"
                 ),
                 "criteria": [
-                    "Unwilling: the bot is exhausted or the persona would find this conversation draining",
-                    "Reluctant: energy is low and nothing here rekindles interest",
-                    "Neutral: the persona is indifferent either way",
-                    "Willing: decent energy and the topic is pleasant",
-                    "Eager: good energy and the persona would genuinely want to jump in",
+                    "No interest at all: the topic leaves the persona completely cold",
+                    "Little interest: the persona would have nothing to say about this topic",
+                    "Mild interest: the persona could take it or leave it",
+                    "Interested: the persona would enjoy talking about this topic",
+                    "Strong interest: the topic is exactly what this persona loves to talk about",
                 ],
             },
             "social": {
