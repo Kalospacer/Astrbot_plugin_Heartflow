@@ -16,7 +16,7 @@
     "description": "回复阈值(0-1)",
     "type": "float",
     "default": 0.6,
-    "hint": "超过此阈值才会主动回复，值越高越严格",
+    "hint": "超过此阈值才会主动回复，值越高越严格。judge_mode=llm 时比较的是五维加权综合分，judge_mode=jev 时比较的是 noul 概率",
     "slider": {
       "min": 0,
       "max": 1,
@@ -133,7 +133,7 @@
     "description": "判断失败最大重试次数",
     "type": "int",
     "default": 3,
-    "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次（judge_mode=jev 时无效，Jev 返回结构化答案无需重试）",
+    "hint": "判断重试次数，设为0时不重试，建议1-5次。llm 模式重试的是无效JSON，jev 模式重试的是 429/529 限流",
     "slider": {
       "min": 0,
       "max": 5,
@@ -199,6 +199,8 @@
     "description": "判断引擎模式",
     "type": "string",
     "default": "llm",
+    "options": ["llm", "jev"],
+    "labels": ["小参数 LLM", "TypeSafe Jev"],
     "hint": "llm = 小参数模型判断（现状）；jev = TypeSafe Jev 判断引擎（结构化打分+置信度，需 API key）"
   },
   "jev_api_key": {

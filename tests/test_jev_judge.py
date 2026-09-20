@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, patch
 
 from test_main import _config, _Context, _Event, heartflow
 
+_SCORE_NAMES = heartflow._SCORE_NAMES
+
 
 class _JevResp:
     def __init__(self, status_code=200, data=None, text="", headers=None):
@@ -20,7 +22,7 @@ def _jev_payload(score_map=None, noul=None, conf_map=None):
     score_map = score_map or {}
     conf_map = conf_map or {}
     answers = {}
-    for name in ("relevance", "willingness", "social", "timing", "continuity"):
+    for name in _SCORE_NAMES:
         answers[name] = {
             "type": "score",
             "score": score_map.get(name, 3.0),
@@ -55,49 +57,50 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_noul_is_the_decision_signal(self):
         # 五维中等（overall 0.5 < 0.6）但 noul 0.9 ≥ 0.6 → 触发（noul 决定）
         plugin = self._plugin()
-        mid = {n: 2.0 for n in plugin._JEV_SCORE_NAMES}
+        mid = {n: 2.0 for n in _SCORE_NAMES}
         result, _ = await self._run_judge(
             plugin, [_JevResp(200, _jev_payload(score_map=mid, noul=0.9))]
         )
-        self.assertAlmostEqual(result.overall_score, 0.5)
+        self.assertIn("5dim=0.50", result.reasoning)
         self.assertTrue(result.should_reply)
-        self.assertAlmostEqual(result.noul, 0.9)
+        self.assertAlmostEqual(result.overall_score, 0.9)
         self.assertAlmostEqual(result.confidence, 0.9)
         self.assertIn("by=noul", result.reasoning)
+        self.assertIn("noul=0.90", result.reasoning)
 
         # 五维满分（overall 1.0）但 noul 0.3 < 0.6 → 不触发
         plugin = self._plugin()
-        high = {n: 4.0 for n in plugin._JEV_SCORE_NAMES}
+        high = {n: 4.0 for n in _SCORE_NAMES}
         result, _ = await self._run_judge(
             plugin, [_JevResp(200, _jev_payload(score_map=high, noul=0.3))]
         )
-        self.assertAlmostEqual(result.overall_score, 1.0)
+        self.assertIn("5dim=1.00", result.reasoning)
+        self.assertAlmostEqual(result.overall_score, 0.3)
         self.assertFalse(result.should_reply)
 
     async def test_missing_noul_falls_back_to_five_dimensions(self):
         # noul 缺失时回退五维加权：overall 0.8 ≥ 0.6 → 触发，日志标注 fallback
         plugin = self._plugin()
-        high = {n: 3.2 for n in plugin._JEV_SCORE_NAMES}
+        high = {n: 3.2 for n in _SCORE_NAMES}
         result, _ = await self._run_judge(
             plugin, [_JevResp(200, _jev_payload(score_map=high, noul=None))]
         )
         self.assertAlmostEqual(result.overall_score, 0.8)
         self.assertTrue(result.should_reply)
-        self.assertIsNone(result.noul)
+        self.assertIn("noul=缺失", result.reasoning)
         self.assertIn("5dim-fallback", result.reasoning)
 
     async def test_low_confidence_does_not_block_decision(self):
         # 维度置信度仅作观测：某维 conf 极低不影响 noul 决策
         plugin = self._plugin()
-        high = {n: 4.0 for n in plugin._JEV_SCORE_NAMES}
-        conf = {n: 0.95 for n in plugin._JEV_SCORE_NAMES}
+        high = {n: 4.0 for n in _SCORE_NAMES}
+        conf = {n: 0.95 for n in _SCORE_NAMES}
         conf["social"] = 0.0
         result, _ = await self._run_judge(
             plugin,
             [_JevResp(200, _jev_payload(score_map=high, noul=0.9, conf_map=conf))],
         )
         self.assertTrue(result.should_reply)
-        self.assertAlmostEqual(result.confidences["social"], 0.0)
         self.assertIn("min_conf=0.00", result.reasoning)
 
     async def test_429_backoff_then_success(self):
@@ -134,7 +137,7 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_score_out_of_range_fails(self):
         plugin = self._plugin()
-        bad = {n: 3.0 for n in plugin._JEV_SCORE_NAMES}
+        bad = {n: 3.0 for n in _SCORE_NAMES}
         bad["timing"] = 5.0  # 超出 0-4 档
         result, _ = await self._run_judge(
             plugin, [_JevResp(200, _jev_payload(score_map=bad))]
