@@ -334,28 +334,37 @@ class HeartflowPlugin(star.Star):
 
         logger.info("心流插件已初始化")
 
-    async def _get_or_create_summarized_system_prompt(
-        self, event: AstrMessageEvent, original_prompt: str
-    ) -> str:
-        """获取或创建精简版系统提示词"""
+    async def _resolve_conversation_persona(
+        self, event: AstrMessageEvent
+    ) -> tuple[str | None, str | None]:
+        """解析当前会话绑定的 (conversation_id, persona_id)。
+
+        get_conversation 会把整段对话历史 json.dumps 出来，而这里只要 persona_id，
+        所以一次判断只解析一次，结果同时喂给取人格和人格摘要两处。
+        """
         try:
-            # 获取当前会话ID
             curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
                 event.unified_msg_origin
             )
             if not curr_cid:
-                return original_prompt
-
-            # 获取当前人格ID作为缓存键（仅用 persona_id，不包含 cid）
-            # cid 随对话切换会变，但提示词是按人格存的，缓存键不应包含 cid
+                return None, None
             conversation = await self.context.conversation_manager.get_conversation(
                 event.unified_msg_origin, curr_cid
             )
-            persona_id = (
-                conversation.persona_id if conversation else None
-            ) or "default"
+            return curr_cid, (conversation.persona_id if conversation else None)
+        except Exception as e:
+            logger.debug(f"解析会话人格失败: {e}")
+            return None, None
 
-            # 构建缓存键
+    async def _get_or_create_summarized_system_prompt(
+        self, original_prompt: str, curr_cid: str | None, persona_id: str | None
+    ) -> str:
+        """获取或创建精简版系统提示词"""
+        if not curr_cid:
+            return original_prompt
+        try:
+            # 缓存键只用 persona_id：cid 随对话切换会变，但提示词是按人格存的
+            persona_id = persona_id or "default"
             cache_key = persona_id
 
             # 检查缓存
@@ -496,14 +505,17 @@ class HeartflowPlugin(star.Star):
         chat_state = self._get_chat_state(event.unified_msg_origin)
 
         # 获取当前对话的人格系统提示词，让模型了解大参数LLM的角色设定
-        original_persona_prompt = await self._get_persona_system_prompt(event)
+        curr_cid, persona_id = await self._resolve_conversation_persona(event)
+        original_persona_prompt = await self._get_persona_system_prompt(
+            event, persona_id
+        )
         logger.debug(
             f"小参数模型获取原始人格提示词: {'有' if original_persona_prompt else '无'} | 长度: {len(original_persona_prompt) if original_persona_prompt else 0}"
         )
 
         # 获取或创建精简版系统提示词
         persona_system_prompt = await self._get_or_create_summarized_system_prompt(
-            event, original_persona_prompt
+            original_persona_prompt, curr_cid, persona_id
         )
         logger.debug(
             f"小参数模型使用精简人格提示词: {'有' if persona_system_prompt else '无'} | 长度: {len(persona_system_prompt) if persona_system_prompt else 0}"
@@ -688,10 +700,11 @@ class HeartflowPlugin(star.Star):
         self, event: AstrMessageEvent, chat_state: ChatState
     ) -> dict:
         """组装 Jev state：人格、精力、活跃度、最近消息流、上次回复、当前消息。"""
-        original_persona = await self._get_persona_system_prompt(event)
+        curr_cid, persona_id = await self._resolve_conversation_persona(event)
+        original_persona = await self._get_persona_system_prompt(event, persona_id)
         if self.judge_provider_name:
             persona_text = await self._get_or_create_summarized_system_prompt(
-                event, original_persona
+                original_persona, curr_cid, persona_id
             )
         else:
             # jev 模式未配摘要 LLM：截断原始人格保留核心，零额外调用
@@ -1367,26 +1380,16 @@ class HeartflowPlugin(star.Star):
         )
         logger.info(f"系统提示词缓存已清除，共清除 {cache_count} 个缓存")
 
-    async def _get_persona_system_prompt(self, event: AstrMessageEvent) -> str:
-        """获取当前对话的人格系统提示词"""
+    async def _get_persona_system_prompt(
+        self, event: AstrMessageEvent, persona_id: str | None
+    ) -> str:
+        """按会话绑定的 persona_id 取人格系统提示词"""
+        # 用户显式取消人格
+        if persona_id == "[%None]":
+            return ""
+
         try:
             persona_mgr = self.context.persona_manager
-
-            # 获取当前对话，尝试拿到会话绑定的 persona_id
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
-                event.unified_msg_origin
-            )
-            persona_id: str | None = None
-            if curr_cid:
-                conversation = await self.context.conversation_manager.get_conversation(
-                    event.unified_msg_origin, curr_cid
-                )
-                if conversation:
-                    persona_id = conversation.persona_id
-
-            # 用户显式取消人格
-            if persona_id == "[%None]":
-                return ""
 
             if persona_id:
                 # 直接通过 PersonaManager 查询数据库
