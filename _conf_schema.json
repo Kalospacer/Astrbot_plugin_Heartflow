@@ -173,6 +173,17 @@
       "step": 30
     }
   },
+  "debounce_seconds": {
+    "description": "判断防抖窗口（秒）",
+    "type": "float",
+    "default": 0,
+    "hint": "0 表示关闭（每条消息都判断）。设为正数时，新消息先等这么久，期间若又有新消息就把判断权让给最新那条，一个窗口只判断一次——刷屏时省判断调用，也避免在别人话说到一半时插嘴",
+    "slider": {
+      "min": 0,
+      "max": 60,
+      "step": 0.5
+    }
+  },
   "max_tracked_chats": {
     "description": "最大群聊状态数量",
     "type": "int",

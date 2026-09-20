@@ -60,6 +60,7 @@ class ChatState:
     total_messages: int = 0
     total_replies: int = 0
     last_access_time: float = 0.0
+    debounce_seq: int = 0
 
 
 def _extract_json(text: str) -> object:
@@ -239,6 +240,9 @@ class HeartflowPlugin(star.Star):
         )
         self.energy_recovery_rate = _get_number_config(
             self.config, "energy_recovery_rate", 0.02, 0.0, 1.0
+        )
+        self.debounce_seconds = _get_number_config(
+            self.config, "debounce_seconds", 0.0, 0.0, 60.0
         )
         self.context_messages_count = _get_number_config(
             self.config, "context_messages_count", 5, 1, 100, integer=True
@@ -687,9 +691,13 @@ class HeartflowPlugin(star.Star):
         return self._jev_client
 
     def _build_jev_chat_log(self, event: AstrMessageEvent) -> list[dict]:
-        """从原始消息缓冲构建 Jev chat_log 字段（排除刚记录的当前消息）。"""
-        # 最后一条必是 on_group_message 刚记录的当前消息
-        msgs = self._get_raw_buffer(event.unified_msg_origin)[:-1]
+        """从原始消息缓冲构建 Jev chat_log 字段（排除当前消息本身）。"""
+        current = event.get_extra("heartflow_raw_msg")
+        msgs = [
+            m
+            for m in self._get_raw_buffer(event.unified_msg_origin)
+            if m is not current
+        ]
         recent = msgs[-self.judge_context_count :]
         return [
             {"from": ("bot" if m.is_bot else m.sender_name), "text": m.content}
@@ -881,15 +889,18 @@ class HeartflowPlugin(star.Star):
         umo = event.unified_msg_origin
         if umo not in self._raw_msg_buffer:
             self._raw_msg_buffer[umo] = deque(maxlen=self._raw_msg_buffer_size)
-        self._raw_msg_buffer[umo].append(
-            RawMessage(
-                sender_name=event.get_sender_name(),
-                sender_id=str(event.get_sender_id()),
-                content=event.message_str,
-                timestamp=time.time(),
-                is_bot=is_bot,
-            )
+        raw = RawMessage(
+            sender_name=event.get_sender_name(),
+            sender_id=str(event.get_sender_id()),
+            content=event.message_str,
+            timestamp=time.time(),
+            is_bot=is_bot,
         )
+        self._raw_msg_buffer[umo].append(raw)
+        if not is_bot:
+            # 记下这条消息本体，判断时按对象身份把它从 chat_log 里摘掉。
+            # 不能靠"缓冲最后一条就是它"——防抖等待期间还会有别的消息进来。
+            event.set_extra("heartflow_raw_msg", raw)
 
     def _get_raw_buffer(self, umo: str) -> list[RawMessage]:
         """获取缓冲区中的消息列表（时间顺序）"""
@@ -950,34 +961,56 @@ class HeartflowPlugin(star.Star):
             if not self._should_process_message(event):
                 return
 
-            try:
-                judge_result = await self.judge_with_tiny_model(event)
+            if self.debounce_seconds <= 0:
+                await self._judge_and_trigger(event, chat_id)
+                return
 
-                if judge_result.should_reply:
-                    logger.info(
-                        f"心流触发主动回复 | {chat_id[:20]}... | "
-                        f"评分:{judge_result.overall_score:.2f}"
-                    )
-                    event.is_at_or_wake_command = True
-                    event.set_extra("heartflow_triggered", True)
-                    event.set_extra("heartflow_judge_result", judge_result)
-                    trigger_time = time.time()
-                    self._get_chat_state(chat_id).last_trigger_time = trigger_time
-                    event.set_extra("heartflow_trigger_time", trigger_time)
-                    logger.info(
-                        f"心流设置唤醒标志 | {chat_id[:20]}... | "
-                        f"评分:{judge_result.overall_score:.2f} | "
-                        f"{judge_result.reasoning[:50]}..."
-                    )
-                else:
-                    logger.debug(
-                        f"心流判断不通过 | {chat_id[:20]}... | "
-                        f"评分:{judge_result.overall_score:.2f} | "
-                        f"原因: {judge_result.reasoning[:30]}..."
-                    )
-                    self._update_passive_state(event, judge_result)
-            except Exception:
-                logger.exception("心流插件处理消息异常")
+            # 防抖：先登记为窗口内最新的一条，等窗口结束再看判断权是否还在自己手里
+            state = self._get_chat_state(chat_id)
+            state.debounce_seq += 1
+            seq = state.debounce_seq
+
+        await asyncio.sleep(self.debounce_seconds)
+
+        async with self._get_chat_lock(chat_id):
+            if self._get_chat_state(chat_id).debounce_seq != seq:
+                # 窗口内又来了新消息，判断权交给它——本条已在缓冲里，它看得到
+                return
+            # 等待期间冷却可能已被别的触发占掉，重新校验
+            if not self._should_process_message(event):
+                return
+            await self._judge_and_trigger(event, chat_id)
+
+    async def _judge_and_trigger(self, event: AstrMessageEvent, chat_id: str) -> None:
+        """判断当前消息，命中就把事件标记成唤醒交给主 LLM。调用方需持有群聊锁。"""
+        try:
+            judge_result = await self.judge_with_tiny_model(event)
+
+            if judge_result.should_reply:
+                logger.info(
+                    f"心流触发主动回复 | {chat_id[:20]}... | "
+                    f"评分:{judge_result.overall_score:.2f}"
+                )
+                event.is_at_or_wake_command = True
+                event.set_extra("heartflow_triggered", True)
+                event.set_extra("heartflow_judge_result", judge_result)
+                trigger_time = time.time()
+                self._get_chat_state(chat_id).last_trigger_time = trigger_time
+                event.set_extra("heartflow_trigger_time", trigger_time)
+                logger.info(
+                    f"心流设置唤醒标志 | {chat_id[:20]}... | "
+                    f"评分:{judge_result.overall_score:.2f} | "
+                    f"{judge_result.reasoning[:50]}..."
+                )
+            else:
+                logger.debug(
+                    f"心流判断不通过 | {chat_id[:20]}... | "
+                    f"评分:{judge_result.overall_score:.2f} | "
+                    f"原因: {judge_result.reasoning[:30]}..."
+                )
+                self._update_passive_state(event, judge_result)
+        except Exception:
+            logger.exception("心流插件处理消息异常")
 
     def _should_record_llm_response(self, event: AstrMessageEvent) -> bool:
         """检查 LLM 回复是否属于本插件追踪的群聊语境。"""
@@ -1307,6 +1340,7 @@ class HeartflowPlugin(star.Star):
 - 最大重试次数: {self.judge_max_retries}
 
 ⚙️ **配置参数**
+- 判断防抖: {f"{self.debounce_seconds:g}s 窗口" if self.debounce_seconds > 0 else "❌ 关闭（逐条判断）"}
 - 白名单模式: {"✅ 开启" if self.whitelist_enabled else "❌ 关闭"}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
