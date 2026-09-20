@@ -194,13 +194,6 @@ class HeartflowPlugin(star.Star):
         self.jev_model = str(
             self.config.get("jev_model", "jev-1.13.0") or "jev-1.13.0"
         ).strip()
-        self.jev_use_noul_gate = bool(self.config.get("jev_use_noul_gate", False))
-        self.jev_noul_gate_threshold = _get_number_config(
-            self.config, "jev_noul_gate_threshold", 0.5, 0.0, 1.0
-        )
-        self.jev_min_confidence = _get_number_config(
-            self.config, "jev_min_confidence", 0.0, 0.0, 1.0
-        )
         self._jev_client: httpx.AsyncClient | None = None
 
         # 群聊状态管理
@@ -888,31 +881,22 @@ class HeartflowPlugin(star.Star):
             + continuity * self.weights["continuity"]
         ) / 10.0
 
-        should_reply = overall_score >= self.reply_threshold
-        gate_notes: list[str] = []
-        if self.jev_use_noul_gate and noul is not None:
-            if noul < self.jev_noul_gate_threshold:
-                should_reply = False
-                gate_notes.append(
-                    f"noul gate {noul:.2f}<{self.jev_noul_gate_threshold:g}"
-                )
-        if self.jev_min_confidence > 0 and confidences:
-            low_conf = [
-                name for name, c in confidences.items() if c < self.jev_min_confidence
-            ]
-            if low_conf:
-                should_reply = False
-                gate_notes.append(
-                    f"low confidence<{self.jev_min_confidence:g}: {','.join(low_conf)}"
-                )
+        # 决策信号是 noul（Jev 校准概率）；五维加权仅作观测日志。
+        # noul 缺失/非法时回退五维加权，保守可用。
+        decision_by = "noul"
+        if noul is not None:
+            should_reply = noul >= self.reply_threshold
+        else:
+            should_reply = overall_score >= self.reply_threshold
+            decision_by = "5dim-fallback"
 
         min_conf = min(confidences.values()) if confidences else 0.0
         reasoning = (
+            f"by={decision_by} "
             f"rel={relevance:.1f} wil={willingness:.1f} soc={social:.1f} "
             f"tim={timing:.1f} con={continuity:.1f}"
-            + (f" | noul={noul:.2f}" if noul is not None else "")
+            + (f" | noul={noul:.2f}" if noul is not None else " | noul=缺失")
             + (f" | min_conf={min_conf:.2f}" if confidences else "")
-            + (f" | {', '.join(gate_notes)}" if gate_notes else "")
         )
 
         logger.info(
@@ -929,7 +913,7 @@ class HeartflowPlugin(star.Star):
             continuity=continuity,
             reasoning=reasoning,
             should_reply=should_reply,
-            confidence=overall_score,
+            confidence=noul if noul is not None else overall_score,
             overall_score=overall_score,
             related_messages=[],
             noul=noul,
@@ -1358,8 +1342,7 @@ class HeartflowPlugin(star.Star):
 
 🔷 **Jev 配置**{"" if self.judge_mode == "jev" else "（当前未启用）"}
 - 模型: {self.jev_model}
-- Noul 门槛: {"✅ " + str(self.jev_noul_gate_threshold) if self.jev_use_noul_gate else "❌ 关闭"}
-- 最低置信度: {self.jev_min_confidence if self.jev_min_confidence > 0 else "❌ 关闭"}
+- 决策信号: noul 概率（五维分数仅观测日志）
 - API key: {"✅ 已配置" if self._jev_key() else "❌ 未配置"}
 
 🧠 **智能缓存**

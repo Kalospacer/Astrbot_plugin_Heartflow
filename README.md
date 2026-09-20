@@ -14,18 +14,13 @@
 
 ## Jev 判断引擎（judge_mode=jev）
 
-[TypeSafe Jev](https://typesafe.ai/) 是判断专用模型：一次请求并行评估五维 Score（0-4 档）加一道总判断 Noul，返回概率加权分、概率分布和每题置信度，输出结构化、无需 JSON 重试。按输入 token 计费（$0.042/Mtok），输出免费。
+[TypeSafe Jev](https://typesafe.ai/) 是判断专用模型：一次请求并行评估一道总判断 Noul 加五维 Score 观测题。Noul 返回校准过的"该不该回复"概率，直接作为触发信号（`reply_threshold` 作用于它）；五维 Score（内容、意愿、社交、时机、连贯）只记入日志用于观测调参，不参与触发决策；Noul 缺失时回退五维加权。按输入 token 计费（$0.042/Mtok），输出免费。
 
 配置方式：
 
 1. 将 `judge_mode` 设为 `jev`。
 2. 填写 `jev_api_key`（TypeSafe 控制台获取），或设置环境变量 `TYPESAFE_API_KEY`。
-3. 其余配置（阈值、权重、超时）与 LLM 模式完全通用。
-
-可选加固项：
-
-- `jev_use_noul_gate` + `jev_noul_gate_threshold`：五维加权过阈值之外，总判断概率也须过门槛（双保险）
-- `jev_min_confidence`：任一维度置信度低于此值时不触发（0 关闭）
+3. `reply_threshold` 即 Noul 概率阈值，建议从 0.6 起步观察日志调整。
 
 注意：
 
@@ -33,7 +28,7 @@
 - `judge_max_retries` 对 Jev 模式无效——Jev 返回结构化答案，没有 JSON 解析失败这回事；仅 429/529 限流会在超时预算内退避重试。
 - 人格摘要（`judge_provider_name` 配置的 LLM 压缩人格）在 Jev 模式下仍复用；未配置时自动截断原始人格前 400 字作为判断参考。
 - 官方模型别名 `jev-latest` 会漂移，默认锁定 `jev-1.13.0` 保证判断可复现；判断日志会记录实际响应的模型版本号。
-- Jev 官方提示中文准确率目前低于英语，建议上线后观察判断日志中的各维度分数与置信度，必要时调整 `reply_threshold` 或开启 Noul 门槛。
+- Jev 官方提示中文准确率目前低于英语，建议上线后观察判断日志（每条含 noul 概率与五维分数），必要时调整 `reply_threshold`。
 - 国内服务器需确认到 `api.typesafe.ai` 的网络可达性；不可达时为 AstrBot 进程配置 `https_proxy`。
 
 ## 兼容性
@@ -87,11 +82,8 @@ git clone https://github.com/advent259141/Astrbot_plugin_Heartflow.git
 | `judge_mode` | `llm` | 判断引擎：`llm` 小参数模型 / `jev` TypeSafe Jev |
 | `jev_api_key` | 空 | Jev API key；留空读环境变量 `TYPESAFE_API_KEY` |
 | `jev_model` | `jev-1.13.0` | Jev 模型版本（锁版本可复现，`jev-latest` 跟随官方） |
-| `jev_use_noul_gate` | `false` | 总判断 Noul 作为第二道硬门槛 |
-| `jev_noul_gate_threshold` | `0.5` | Noul 门槛值（开启门槛时生效） |
-| `jev_min_confidence` | `0` | 任一维度置信度下限，0 关闭 |
 
-五项评分权重默认分别为：内容相关度 25%、回复意愿 20%、社交适宜性 20%、时机 15%、连贯性 20%。权重不必手动保证总和为 1，插件会自动归一化；全部为 0 时会回退到默认权重。
+五项评分权重默认分别为：内容相关度 25%、回复意愿 20%、社交适宜性 20%、时机 15%、连贯性 20%。权重不必手动保证总和为 1，插件会自动归一化；全部为 0 时会回退到默认权重。注意：权重只在 `judge_mode=llm` 时参与触发决策；`judge_mode=jev` 时决策由 Noul 概率做出，权重仅影响观测日志中的综合分。
 
 ## 管理命令
 

@@ -52,49 +52,53 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
             result = await plugin._judge_with_jev(_Event())
         return result, client
 
-    async def test_scores_mapped_zero_to_ten_and_weighted(self):
-        # 五维各 2.0/4 → 5/10 → overall 0.5 < 默认阈值 0.6 → 不触发
+    async def test_noul_is_the_decision_signal(self):
+        # 五维中等（overall 0.5 < 0.6）但 noul 0.9 ≥ 0.6 → 触发（noul 决定）
         plugin = self._plugin()
         mid = {n: 2.0 for n in plugin._JEV_SCORE_NAMES}
         result, _ = await self._run_judge(
             plugin, [_JevResp(200, _jev_payload(score_map=mid, noul=0.9))]
         )
-        self.assertAlmostEqual(result.relevance, 5.0)
         self.assertAlmostEqual(result.overall_score, 0.5)
-        self.assertFalse(result.should_reply)
-        self.assertAlmostEqual(result.noul, 0.9)
-
-        # 五维各 3.2/4 → 8/10 → overall 0.8 ≥ 0.6 → 触发
-        plugin = self._plugin()
-        high = {n: 3.2 for n in plugin._JEV_SCORE_NAMES}
-        result, _ = await self._run_judge(
-            plugin, [_JevResp(200, _jev_payload(score_map=high, noul=0.9))]
-        )
-        self.assertAlmostEqual(result.overall_score, 0.8)
         self.assertTrue(result.should_reply)
+        self.assertAlmostEqual(result.noul, 0.9)
+        self.assertAlmostEqual(result.confidence, 0.9)
+        self.assertIn("by=noul", result.reasoning)
 
-    async def test_noul_gate_blocks_when_below_threshold(self):
-        plugin = self._plugin(jev_use_noul_gate=True, jev_noul_gate_threshold=0.5)
+        # 五维满分（overall 1.0）但 noul 0.3 < 0.6 → 不触发
+        plugin = self._plugin()
         high = {n: 4.0 for n in plugin._JEV_SCORE_NAMES}
         result, _ = await self._run_judge(
             plugin, [_JevResp(200, _jev_payload(score_map=high, noul=0.3))]
         )
         self.assertAlmostEqual(result.overall_score, 1.0)
         self.assertFalse(result.should_reply)
-        self.assertIn("noul gate", result.reasoning)
 
-    async def test_min_confidence_blocks_low_dimension(self):
-        plugin = self._plugin(jev_min_confidence=0.8)
+    async def test_missing_noul_falls_back_to_five_dimensions(self):
+        # noul 缺失时回退五维加权：overall 0.8 ≥ 0.6 → 触发，日志标注 fallback
+        plugin = self._plugin()
+        high = {n: 3.2 for n in plugin._JEV_SCORE_NAMES}
+        result, _ = await self._run_judge(
+            plugin, [_JevResp(200, _jev_payload(score_map=high, noul=None))]
+        )
+        self.assertAlmostEqual(result.overall_score, 0.8)
+        self.assertTrue(result.should_reply)
+        self.assertIsNone(result.noul)
+        self.assertIn("5dim-fallback", result.reasoning)
+
+    async def test_low_confidence_does_not_block_decision(self):
+        # 维度置信度仅作观测：某维 conf 极低不影响 noul 决策
+        plugin = self._plugin()
         high = {n: 4.0 for n in plugin._JEV_SCORE_NAMES}
         conf = {n: 0.95 for n in plugin._JEV_SCORE_NAMES}
-        conf["social"] = 0.5
+        conf["social"] = 0.0
         result, _ = await self._run_judge(
             plugin,
             [_JevResp(200, _jev_payload(score_map=high, noul=0.9, conf_map=conf))],
         )
-        self.assertFalse(result.should_reply)
-        self.assertIn("low confidence", result.reasoning)
-        self.assertAlmostEqual(result.confidences["social"], 0.5)
+        self.assertTrue(result.should_reply)
+        self.assertAlmostEqual(result.confidences["social"], 0.0)
+        self.assertIn("min_conf=0.00", result.reasoning)
 
     async def test_429_backoff_then_success(self):
         plugin = self._plugin()

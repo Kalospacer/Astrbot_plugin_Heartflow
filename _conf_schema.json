@@ -218,33 +218,5 @@
     "type": "string",
     "default": "jev-1.13.0",
     "hint": "锁定版本保证判断可复现；填 jev-latest 则跟随官方最新（别名会漂移）"
-  },
-  "jev_use_noul_gate": {
-    "description": "启用 Noul 总判断门槛",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，五维加权过阈值之外，总判断概率也须过门槛才会触发回复（双保险）"
-  },
-  "jev_noul_gate_threshold": {
-    "description": "Noul 门槛值(0-1)",
-    "type": "float",
-    "default": 0.5,
-    "hint": "总判断概率低于此值时不触发回复，仅在启用 Noul 门槛时生效",
-    "slider": {
-      "min": 0,
-      "max": 1,
-      "step": 0.05
-    }
-  },
-  "jev_min_confidence": {
-    "description": "Jev 最低置信度(0-1)",
-    "type": "float",
-    "default": 0,
-    "hint": "任一维度置信度低于此值时不触发回复，0 表示关闭",
-    "slider": {
-      "min": 0,
-      "max": 1,
-      "step": 0.05
-    }
   }
 }
