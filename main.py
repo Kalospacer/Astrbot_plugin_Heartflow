@@ -2,11 +2,14 @@ import asyncio
 import datetime
 import json
 import math
+import os
 import re
 import time
 import weakref
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+
+import httpx
 
 import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
@@ -28,10 +31,14 @@ class JudgeResult:
     confidence: float = 0.0
     overall_score: float = 0.0
     related_messages: list | None = None
+    noul: float | None = None
+    confidences: dict | None = None
 
     def __post_init__(self):
         if self.related_messages is None:
             self.related_messages = []
+        if self.confidences is None:
+            self.confidences = {}
 
 
 @dataclass
@@ -167,6 +174,34 @@ class HeartflowPlugin(star.Star):
             if isinstance(raw_whitelist, list)
             else set()
         )
+
+        # Jev 判断引擎配置
+        self.judge_mode = (
+            str(self.config.get("judge_mode", "llm") or "llm").strip().lower()
+        )
+        if self.judge_mode not in ("llm", "jev"):
+            logger.warning(f"未知 judge_mode={self.judge_mode}，已回退到 llm")
+            self.judge_mode = "llm"
+        self.jev_api_key = str(self.config.get("jev_api_key", "") or "").strip()
+        self.jev_base_url = (
+            str(
+                self.config.get("jev_base_url", "https://api.typesafe.ai")
+                or "https://api.typesafe.ai"
+            )
+            .strip()
+            .rstrip("/")
+        )
+        self.jev_model = str(
+            self.config.get("jev_model", "jev-1.13.0") or "jev-1.13.0"
+        ).strip()
+        self.jev_use_noul_gate = bool(self.config.get("jev_use_noul_gate", False))
+        self.jev_noul_gate_threshold = _get_number_config(
+            self.config, "jev_noul_gate_threshold", 0.5, 0.0, 1.0
+        )
+        self.jev_min_confidence = _get_number_config(
+            self.config, "jev_min_confidence", 0.0, 0.0, 1.0
+        )
+        self._jev_client: httpx.AsyncClient | None = None
 
         # 群聊状态管理
         self.chat_states: dict[str, ChatState] = {}
@@ -336,6 +371,12 @@ class HeartflowPlugin(star.Star):
             return original_prompt
 
     async def judge_with_tiny_model(self, event: AstrMessageEvent) -> JudgeResult:
+        """判断入口：按 judge_mode 路由到 Jev 判断引擎或小参数 LLM。"""
+        if self.judge_mode == "jev":
+            return await self._judge_with_jev(event)
+        return await self._judge_with_llm(event)
+
+    async def _judge_with_llm(self, event: AstrMessageEvent) -> JudgeResult:
         """使用小模型进行智能判断"""
 
         if not self.judge_provider_name:
@@ -554,6 +595,346 @@ class HeartflowPlugin(star.Star):
         except Exception as e:
             logger.error(f"小参数模型判断异常: {e}")
             return JudgeResult(should_reply=False, reasoning=f"异常: {str(e)}")
+
+    # ------------------------------------------------------------------
+    # Jev 判断引擎（TypeSafe System One）
+    # ------------------------------------------------------------------
+
+    _JEV_SCORE_NAMES = ("relevance", "willingness", "social", "timing", "continuity")
+
+    @staticmethod
+    def _build_jev_questions() -> dict:
+        """六道判断题：五维 Score（0-4 档）+ 一道总 Noul。
+
+        每档边界写死（参考陪伴插件的教训：禁止正则词表，语义边界交给模型）。
+        """
+        return {
+            "relevance": {
+                "type": "score",
+                "instructions": (
+                    "How relevant is the current message to the bot's persona? "
+                    "Judge whether the persona has something genuine to contribute."
+                ),
+                "criteria": [
+                    "Completely irrelevant: random chatter the persona has no stake in, or content it could not meaningfully respond to",
+                    "Mostly irrelevant: generic small talk with nothing for the persona to hook onto",
+                    "Somewhat relevant: the persona could respond, but would add little value",
+                    "Clearly relevant: matches the persona's interests or expertise, and the persona has something real to contribute",
+                    "Directly relevant: the message explicitly invites this persona's participation, e.g. asks the kind of question this persona would answer or touches its core interests",
+                ],
+            },
+            "willingness": {
+                "type": "score",
+                "instructions": (
+                    "Given the bot's current energy (bot_energy, 0-1) and persona, "
+                    "how willing would the bot be to join this conversation right now?"
+                ),
+                "criteria": [
+                    "Unwilling: the bot is exhausted or the persona would find this conversation draining",
+                    "Reluctant: energy is low and nothing here rekindles interest",
+                    "Neutral: the persona is indifferent either way",
+                    "Willing: decent energy and the topic is pleasant",
+                    "Eager: good energy and the persona would genuinely want to jump in",
+                ],
+            },
+            "social": {
+                "type": "score",
+                "instructions": (
+                    "How socially appropriate would a reply from the bot be in the current group atmosphere? "
+                    "Messages clearly exchanged between other members must score low."
+                ),
+                "criteria": [
+                    "Socially wrong: the message is part of a private exchange between other members, or an emotional moment the bot should not intrude on",
+                    "Poor fit: a reply would interrupt the current flow between members",
+                    "Neutral: a reply would be neither welcome nor intrusive",
+                    "Good fit: the conversation is open and a bot reply would feel natural",
+                    "Ideal: the group is waiting for someone to respond, or the message openly invites any member to chime in",
+                ],
+            },
+            "timing": {
+                "type": "score",
+                "instructions": (
+                    "Given minutes_since_last_reply, is now a good moment for the bot to speak again? "
+                    "Speaking too soon after the last reply is spammy."
+                ),
+                "criteria": [
+                    "Terrible timing: the bot just spoke and speaking again now would be spammy",
+                    "Too soon: the bot replied within the last few minutes",
+                    "Acceptable: some time has passed since the bot's last reply",
+                    "Good: it has been a while since the bot last spoke",
+                    "Perfect: the bot has not replied for a long time, or has never replied in this chat",
+                ],
+            },
+            "continuity": {
+                "type": "score",
+                "instructions": (
+                    "How strongly is the current message connected to the bot's last reply? "
+                    "When there is no previous bot reply, treat the connection as neutral (middle)."
+                ),
+                "criteria": [
+                    "Totally disconnected: a new topic with zero relation to anything the bot said; jumping in would feel random",
+                    "Weak link: only a superficial connection to the bot's last reply",
+                    "Neutral: no previous bot reply exists, or the connection is neither strong nor weak",
+                    "Clear link: the message follows up on the bot's last reply or stays on the same topic",
+                    "Direct continuation: the message explicitly responds to or quotes the bot's last reply",
+                ],
+            },
+            "should_reply": {
+                "type": "noul",
+                "instructions": (
+                    "Considering the persona, the bot's energy, the recent chat flow, and the timing, "
+                    "should the bot proactively reply to the current message? "
+                    "Answer YES only if a reply would feel natural and welcome, like a regular group member choosing to speak. "
+                    "Answer NO for messages clearly directed at other members, for contentless filler, "
+                    "or when the bot has been too active recently."
+                ),
+                "criteria": {
+                    "true": "A natural, welcome moment to join the conversation",
+                    "false": "The bot should stay silent: the message is for someone else, adds nothing for the persona, or the timing is wrong",
+                },
+            },
+        }
+
+    def _jev_key(self) -> str:
+        """jev_api_key 配置优先，环境变量 TYPESAFE_API_KEY 兜底。"""
+        if self.jev_api_key:
+            return self.jev_api_key
+        return os.environ.get("TYPESAFE_API_KEY", "").strip()
+
+    def _get_jev_client(self) -> httpx.AsyncClient:
+        if self._jev_client is None or self._jev_client.is_closed:
+            self._jev_client = httpx.AsyncClient(
+                base_url=self.jev_base_url,
+                timeout=httpx.Timeout(self.judge_timeout_seconds),
+            )
+        return self._jev_client
+
+    def _build_jev_chat_log(
+        self, event: AstrMessageEvent, max_items: int
+    ) -> list[dict]:
+        """从原始消息缓冲构建 Jev chat_log 字段（排除刚记录的当前消息）。"""
+        msgs = self._get_raw_buffer(event.unified_msg_origin)
+        if msgs:
+            msgs = msgs[:-1]  # 最后一条必是 on_group_message 刚记录的当前消息
+        recent = msgs[-max_items:] if len(msgs) > max_items else msgs
+        return [
+            {"from": ("bot" if m.is_bot else m.sender_name), "text": m.content}
+            for m in recent
+        ]
+
+    async def _build_jev_state(
+        self, event: AstrMessageEvent, chat_state: ChatState
+    ) -> dict:
+        """组装 Jev state：人格、精力、活跃度、最近消息流、上次回复、当前消息。"""
+        original_persona = await self._get_persona_system_prompt(event)
+        if self.judge_provider_name:
+            persona_text = await self._get_or_create_summarized_system_prompt(
+                event, original_persona
+            )
+        else:
+            # jev 模式未配摘要 LLM：截断原始人格保留核心，零额外调用
+            persona_text = (original_persona or "")[:400]
+        if not persona_text:
+            persona_text = "no persona set"
+
+        return {
+            "persona": persona_text,
+            "bot_energy": round(chat_state.energy, 3),
+            "minutes_since_last_reply": self._get_minutes_since_last_reply(
+                event.unified_msg_origin
+            ),
+            "chat_activity": self._build_chat_context(event),
+            "chat_log": self._build_jev_chat_log(event, self.judge_context_count),
+            "bot_last_reply": self._get_last_bot_reply(event) or "",
+            "current_message": {
+                "from": event.get_sender_name(),
+                "text": event.message_str,
+                "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            },
+        }
+
+    @staticmethod
+    def _jev_fail(reason: str) -> JudgeResult:
+        return JudgeResult(should_reply=False, reasoning=reason)
+
+    async def _judge_with_jev(self, event: AstrMessageEvent) -> JudgeResult:
+        """使用 TypeSafe Jev 进行结构化判断（五维 Score + 总 Noul，一次请求并行）。"""
+        api_key = self._jev_key()
+        if not api_key:
+            logger.warning("Jev API key 未配置（jev_api_key 或 TYPESAFE_API_KEY）")
+            return self._jev_fail("Jev API key 未配置")
+
+        chat_state = self._get_chat_state(event.unified_msg_origin)
+        try:
+            state = await self._build_jev_state(event, chat_state)
+        except Exception as e:
+            logger.error(f"Jev state 组装失败: {e}")
+            return self._jev_fail(f"state 组装异常: {e}")
+
+        payload = {
+            "model": self.jev_model,
+            "state": state,
+            "questions": self._build_jev_questions(),
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        client = self._get_jev_client()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.judge_timeout_seconds
+        backoff = 1.0
+        resp = None
+        last_error = ""
+
+        # 最多 3 次尝试；仅 429/529 退避重试，401/422 直接失败
+        for attempt in range(3):
+            try:
+                resp = await client.post("/v1/systemone", json=payload, headers=headers)
+            except httpx.TimeoutException:
+                return self._jev_fail(
+                    f"Jev 请求超时（{self.judge_timeout_seconds:g}s）"
+                )
+            except httpx.HTTPError as e:
+                last_error = f"网络错误: {e}"
+                if attempt < 2 and (deadline - loop.time()) > backoff:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return self._jev_fail(f"Jev {last_error}")
+
+            if resp.status_code == 200:
+                break
+            if resp.status_code in (429, 529) and attempt < 2:
+                retry_after = resp.headers.get("retry-after")
+                try:
+                    wait = float(retry_after) if retry_after else backoff
+                except ValueError:
+                    wait = backoff
+                backoff *= 2
+                if (deadline - loop.time()) <= wait:
+                    return self._jev_fail(f"Jev {resp.status_code} 且重试预算耗尽")
+                logger.warning(f"Jev 返回 {resp.status_code}，{wait:.1f}s 后重试")
+                await asyncio.sleep(wait)
+                continue
+            body = resp.text[:500] if resp.text else ""
+            if resp.status_code == 401:
+                logger.error(f"Jev 401：API key 无效或未配置 | {body}")
+                return self._jev_fail("Jev 401：API key 无效")
+            if resp.status_code == 422:
+                logger.error(f"Jev 422：请求校验失败 | {body}")
+                return self._jev_fail(f"Jev 422：{body[:200]}")
+            logger.error(f"Jev HTTP {resp.status_code} | {body}")
+            return self._jev_fail(f"Jev HTTP {resp.status_code}")
+
+        if resp is None or resp.status_code != 200:
+            return self._jev_fail(last_error or "Jev 请求失败")
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return self._jev_fail("Jev 响应非 JSON")
+
+        model_id = str(data.get("model", "") or "")
+        answers = data.get("answers")
+        if not isinstance(answers, dict):
+            logger.error(f"Jev 响应缺少 answers: {str(data)[:300]}")
+            return self._jev_fail("Jev 响应缺少 answers")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+
+        scores_10: dict[str, float] = {}
+        confidences: dict[str, float] = {}
+        for name in self._JEV_SCORE_NAMES:
+            ans = answers.get(name)
+            if not isinstance(ans, dict):
+                logger.error(f"Jev 响应缺题 {name}")
+                return self._jev_fail(f"Jev 响应缺题 {name}")
+            raw = ans.get("score")
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                logger.error(f"Jev {name} score 非法: {raw!r}")
+                return self._jev_fail(f"Jev {name} score 非法")
+            raw = float(raw)
+            if not math.isfinite(raw) or not 0.0 <= raw <= 4.0:
+                logger.error(f"Jev {name} score 越界: {raw}")
+                return self._jev_fail(f"Jev {name} score 越界")
+            scores_10[name] = raw / 4.0 * 10.0
+            conf = ans.get("confidence")
+            if isinstance(conf, (int, float)) and not isinstance(conf, bool):
+                confidences[name] = float(conf)
+
+        noul_ans = answers.get("should_reply")
+        noul = None
+        if isinstance(noul_ans, dict):
+            n = noul_ans.get("noul")
+            if (
+                isinstance(n, (int, float))
+                and not isinstance(n, bool)
+                and math.isfinite(float(n))
+            ):
+                noul = max(0.0, min(1.0, float(n)))
+
+        relevance = scores_10["relevance"]
+        willingness = scores_10["willingness"]
+        social = scores_10["social"]
+        timing = scores_10["timing"]
+        continuity = scores_10["continuity"]
+
+        overall_score = (
+            relevance * self.weights["relevance"]
+            + willingness * self.weights["willingness"]
+            + social * self.weights["social"]
+            + timing * self.weights["timing"]
+            + continuity * self.weights["continuity"]
+        ) / 10.0
+
+        should_reply = overall_score >= self.reply_threshold
+        gate_notes: list[str] = []
+        if self.jev_use_noul_gate and noul is not None:
+            if noul < self.jev_noul_gate_threshold:
+                should_reply = False
+                gate_notes.append(
+                    f"noul gate {noul:.2f}<{self.jev_noul_gate_threshold:g}"
+                )
+        if self.jev_min_confidence > 0 and confidences:
+            low_conf = [
+                name for name, c in confidences.items() if c < self.jev_min_confidence
+            ]
+            if low_conf:
+                should_reply = False
+                gate_notes.append(
+                    f"low confidence<{self.jev_min_confidence:g}: {','.join(low_conf)}"
+                )
+
+        min_conf = min(confidences.values()) if confidences else 0.0
+        reasoning = (
+            f"rel={relevance:.1f} wil={willingness:.1f} soc={social:.1f} "
+            f"tim={timing:.1f} con={continuity:.1f}"
+            + (f" | noul={noul:.2f}" if noul is not None else "")
+            + (f" | min_conf={min_conf:.2f}" if confidences else "")
+            + (f" | {', '.join(gate_notes)}" if gate_notes else "")
+        )
+
+        logger.info(
+            f"Jev 判断 | {event.unified_msg_origin[:20]}... | 综合:{overall_score:.3f} "
+            f"阈值:{self.reply_threshold} | {reasoning} | model:{model_id or self.jev_model} "
+            f"| in_tok:{usage.get('input_tokens', '?')}"
+        )
+
+        return JudgeResult(
+            relevance=relevance,
+            willingness=willingness,
+            social=social,
+            timing=timing,
+            continuity=continuity,
+            reasoning=reasoning,
+            should_reply=should_reply,
+            confidence=overall_score,
+            overall_score=overall_score,
+            related_messages=[],
+            noul=noul,
+            confidences=confidences,
+        )
 
     def _record_raw_message(
         self, event: AstrMessageEvent, is_bot: bool = False
@@ -968,11 +1349,18 @@ class HeartflowPlugin(star.Star):
 - 回复率: {(chat_state.total_replies / max(1, chat_state.total_messages) * 100):.1f}%
 
 ⚙️ **配置参数**
+- 判断模式: {"Jev" if self.judge_mode == "jev" else "小参数 LLM"}
 - 回复阈值: {self.reply_threshold}
 - 判断提供商: {self.judge_provider_name}
 - 最大重试次数: {self.judge_max_retries}
 - 白名单模式: {"✅ 开启" if self.whitelist_enabled else "❌ 关闭"}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
+
+🔷 **Jev 配置**{"" if self.judge_mode == "jev" else "（当前未启用）"}
+- 模型: {self.jev_model}
+- Noul 门槛: {"✅ " + str(self.jev_noul_gate_threshold) if self.jev_use_noul_gate else "❌ 关闭"}
+- 最低置信度: {self.jev_min_confidence if self.jev_min_confidence > 0 else "❌ 关闭"}
+- API key: {"✅ 已配置" if self._jev_key() else "❌ 未配置"}
 
 🧠 **智能缓存**
 - 系统提示词缓存: {len(self.system_prompt_cache)} 个
@@ -1089,3 +1477,9 @@ class HeartflowPlugin(star.Star):
         self._raw_msg_buffer.clear()
         self.system_prompt_cache.clear()
         self._chat_locks.clear()
+        if self._jev_client is not None and not self._jev_client.is_closed:
+            try:
+                await self._jev_client.aclose()
+            except Exception as e:
+                logger.debug(f"关闭 Jev HTTP 客户端失败: {e}")
+            self._jev_client = None

@@ -1,16 +1,40 @@
 # 心流插件（Heartflow）
 
-基于双模型架构的 AstrBot 群聊主动回复插件。小模型负责判断当前消息是否值得参与，大模型继续使用 AstrBot 当前会话的提供商和人格生成回复。
+基于双模型架构的 AstrBot 群聊主动回复插件。判断模型负责评估当前消息是否值得参与，大模型继续使用 AstrBot 当前会话的提供商和人格生成回复。判断引擎可选：小参数 LLM（默认）或 TypeSafe Jev（结构化判断，v2.4.0 新增）。
 
 ## 功能
 
-- 使用独立的小模型从内容、意愿、社交、时机和连贯性五个维度评分
+- 使用独立的小模型或 Jev 从内容、意愿、社交、时机和连贯性五个维度评分
 - 按群隔离上下文、精力、冷却和统计状态
 - 保存普通群聊和直接 @ 机器人的对话，自动排除命令消息
 - 使用每群异步锁，避免并发消息同时突破冷却限制
 - 将判断规则放在系统提示词中，并严格校验模型返回的 JSON
 - 支持群聊白名单、评分权重、上下文数量、判断超时和最短回复间隔
 - 限制群聊状态与人格摘要缓存，避免长期运行后无界占用内存
+
+## Jev 判断引擎（judge_mode=jev）
+
+[TypeSafe Jev](https://typesafe.ai/) 是判断专用模型：一次请求并行评估五维 Score（0-4 档）加一道总判断 Noul，返回概率加权分、概率分布和每题置信度，输出结构化、无需 JSON 重试。按输入 token 计费（$0.042/Mtok），输出免费。
+
+配置方式：
+
+1. 将 `judge_mode` 设为 `jev`。
+2. 填写 `jev_api_key`（TypeSafe 控制台获取），或设置环境变量 `TYPESAFE_API_KEY`。
+3. 其余配置（阈值、权重、超时）与 LLM 模式完全通用。
+
+可选加固项：
+
+- `jev_use_noul_gate` + `jev_noul_gate_threshold`：五维加权过阈值之外，总判断概率也须过门槛（双保险）
+- `jev_min_confidence`：任一维度置信度低于此值时不触发（0 关闭）
+
+注意：
+
+- 判断指令使用英文（Jev 官方英语准确率最佳），群聊内容保持中文原文。
+- `judge_max_retries` 对 Jev 模式无效——Jev 返回结构化答案，没有 JSON 解析失败这回事；仅 429/529 限流会在超时预算内退避重试。
+- 人格摘要（`judge_provider_name` 配置的 LLM 压缩人格）在 Jev 模式下仍复用；未配置时自动截断原始人格前 400 字作为判断参考。
+- 官方模型别名 `jev-latest` 会漂移，默认锁定 `jev-1.13.0` 保证判断可复现；判断日志会记录实际响应的模型版本号。
+- Jev 官方提示中文准确率目前低于英语，建议上线后观察判断日志中的各维度分数与置信度，必要时调整 `reply_threshold` 或开启 Noul 门槛。
+- 国内服务器需确认到 `api.typesafe.ai` 的网络可达性；不可达时为 AstrBot 进程配置 `https_proxy`。
 
 ## 兼容性
 
@@ -38,10 +62,9 @@ git clone https://github.com/advent259141/Astrbot_plugin_Heartflow.git
 
 ## 必要配置
 
-1. 在 AstrBot 中配置一个成本较低、响应较快的聊天模型提供商。
-2. 将 `judge_provider_name` 设置为该提供商的 ID。
-3. 打开 `enable_heartflow`。
-4. 建议先设置 `min_reply_interval_seconds`，再逐步调整回复阈值。
+1. 选择判断引擎：`judge_mode=llm` 时在 AstrBot 配置一个成本较低、响应较快的聊天模型提供商，并将 `judge_provider_name` 设置为该提供商的 ID；`judge_mode=jev` 时填 `jev_api_key`（此时 `judge_provider_name` 可选，仅用于人格摘要）。
+2. 打开 `enable_heartflow`。
+3. 建议先设置 `min_reply_interval_seconds`，再逐步调整回复阈值。
 
 ## 主要配置
 
@@ -61,6 +84,12 @@ git clone https://github.com/advent259141/Astrbot_plugin_Heartflow.git
 | `judge_max_retries` | `3` | 判断结果格式错误时的重试次数，范围 `0-5` |
 | `max_tracked_chats` | `1000` | 内存中最多保留的群聊状态与消息缓冲数 |
 | `max_persona_cache` | `100` | 内存中最多保留的人格摘要数 |
+| `judge_mode` | `llm` | 判断引擎：`llm` 小参数模型 / `jev` TypeSafe Jev |
+| `jev_api_key` | 空 | Jev API key；留空读环境变量 `TYPESAFE_API_KEY` |
+| `jev_model` | `jev-1.13.0` | Jev 模型版本（锁版本可复现，`jev-latest` 跟随官方） |
+| `jev_use_noul_gate` | `false` | 总判断 Noul 作为第二道硬门槛 |
+| `jev_noul_gate_threshold` | `0.5` | Noul 门槛值（开启门槛时生效） |
+| `jev_min_confidence` | `0` | 任一维度置信度下限，0 关闭 |
 
 五项评分权重默认分别为：内容相关度 25%、回复意愿 20%、社交适宜性 20%、时机 15%、连贯性 20%。权重不必手动保证总和为 1，插件会自动归一化；全部为 0 时会回退到默认权重。
 

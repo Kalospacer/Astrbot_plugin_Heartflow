@@ -133,7 +133,7 @@
     "description": "判断失败最大重试次数",
     "type": "int",
     "default": 3,
-    "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次",
+    "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次（judge_mode=jev 时无效，Jev 返回结构化答案无需重试）",
     "slider": {
       "min": 0,
       "max": 5,
@@ -193,6 +193,58 @@
       "min": 1,
       "max": 1000,
       "step": 10
+    }
+  },
+  "judge_mode": {
+    "description": "判断引擎模式",
+    "type": "string",
+    "default": "llm",
+    "hint": "llm = 小参数模型判断（现状）；jev = TypeSafe Jev 判断引擎（结构化打分+置信度，需 API key）"
+  },
+  "jev_api_key": {
+    "description": "Jev API Key",
+    "type": "string",
+    "default": "",
+    "hint": "TypeSafe 控制台获取；留空时读取环境变量 TYPESAFE_API_KEY"
+  },
+  "jev_base_url": {
+    "description": "Jev API 地址",
+    "type": "string",
+    "default": "https://api.typesafe.ai",
+    "hint": "一般无需修改"
+  },
+  "jev_model": {
+    "description": "Jev 模型版本",
+    "type": "string",
+    "default": "jev-1.13.0",
+    "hint": "锁定版本保证判断可复现；填 jev-latest 则跟随官方最新（别名会漂移）"
+  },
+  "jev_use_noul_gate": {
+    "description": "启用 Noul 总判断门槛",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，五维加权过阈值之外，总判断概率也须过门槛才会触发回复（双保险）"
+  },
+  "jev_noul_gate_threshold": {
+    "description": "Noul 门槛值(0-1)",
+    "type": "float",
+    "default": 0.5,
+    "hint": "总判断概率低于此值时不触发回复，仅在启用 Noul 门槛时生效",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    }
+  },
+  "jev_min_confidence": {
+    "description": "Jev 最低置信度(0-1)",
+    "type": "float",
+    "default": 0,
+    "hint": "任一维度置信度低于此值时不触发回复，0 表示关闭",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
     }
   }
 }
