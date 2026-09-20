@@ -675,15 +675,22 @@ class HeartflowPlugin(star.Star):
             "should_reply": {
                 "type": "noul",
                 "instructions": (
-                    "Considering the persona, the bot's energy, the recent chat flow, and the timing, "
-                    "should the bot proactively reply to the current message? "
-                    "Answer YES only if a reply would feel natural and welcome, like a regular group member choosing to speak. "
-                    "Answer NO for messages clearly directed at other members, for contentless filler, "
-                    "or when the bot has been too active recently."
+                    "You are deciding whether the bot should proactively speak in a group chat. "
+                    "The bot's name and identity are given in the persona. "
+                    "Answer YES only when the current message is directed at the bot: "
+                    "it calls the bot by name or nickname, asks the bot a question, "
+                    "responds to something the bot previously said, "
+                    "or explicitly invites the bot to join or invites another member to interact with the bot. "
+                    "Answer NO when the message addresses a different name (another bot or another member), "
+                    "and NO when the bot is merely the topic of banter or commentary between members "
+                    "without anyone engaging the bot. "
+                    "Answer NO for everything else: conversations between other members, people thinking aloud, "
+                    "and emotional venting not addressed to the bot, even if joining in would feel natural. "
+                    "When in doubt, answer NO."
                 ),
                 "criteria": {
-                    "true": "A natural, welcome moment to join the conversation",
-                    "false": "The bot should stay silent: the message is for someone else, adds nothing for the persona, or the timing is wrong",
+                    "true": "The message speaks to the bot by name or nickname, continues the bot's own thread, or invites interaction with the bot",
+                    "false": "The message is for someone else or another bot, or only talks about the bot without engaging it",
                 },
             },
         }
