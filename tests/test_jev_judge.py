@@ -161,14 +161,14 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
             "chat_activity",
             "chat_log",
             "bot_last_reply",
-            "current_message",
+            "current_messages",
         ):
             self.assertIn(key, state)
         texts = [m["text"] for m in state["chat_log"]]
         self.assertIn("上一条消息", texts)
         self.assertNotIn("当前消息", texts)
         self.assertEqual(state["bot_last_reply"], "bot 上次回复")
-        self.assertEqual(state["current_message"]["text"], "当前消息")
+        self.assertEqual([m["text"] for m in state["current_messages"]], ["当前消息"])
         self.assertEqual(state["persona"], "no persona set")
 
     async def test_persona_truncated_when_no_summary_provider(self):
