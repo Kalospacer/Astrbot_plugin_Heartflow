@@ -12,6 +12,18 @@
     "hint": "用于小参数模型判断的提供商，建议使用响应较快、成本较低的模型",
     "_special": "select_provider"
   },
+  "compress_persona": {
+    "description": "启用人格压缩",
+    "type": "bool",
+    "default": false,
+    "hint": "llm 与 jev 两种模式共用。关闭时判断器拿人格全文；开启后使用下方「压缩人格提示词」，为空时用「判断模型提供商」自动压缩一次并写回，压缩失败的那次仍用全文"
+  },
+  "compressed_persona": {
+    "description": "压缩人格提示词",
+    "type": "text",
+    "default": "",
+    "hint": "判断用的精简人格。留空时开启压缩后的第一次判断会用「判断模型提供商」自动压缩一次并写回这里，之后固定使用这一份，可随时查看和修改；人格改了想重新生成就清空（或 /heartflow_cache_clear）。仅在开启「启用人格压缩」时使用"
+  },
   "reply_threshold": {
     "description": "回复阈值(0-1)",
     "type": "float",
@@ -195,17 +207,6 @@
       "step": 100
     }
   },
-  "max_persona_cache": {
-    "description": "最大人格摘要缓存数量",
-    "type": "int",
-    "default": 100,
-    "hint": "限制内存中的人格提示词摘要缓存，超出后淘汰最久未使用的人格",
-    "slider": {
-      "min": 1,
-      "max": 1000,
-      "step": 10
-    }
-  },
   "judge_mode": {
     "description": "判断引擎模式",
     "type": "string",
@@ -231,5 +232,143 @@
     "type": "string",
     "default": "jev-1.13.0",
     "hint": "锁定版本保证判断可复现；填 jev-latest 则跟随官方最新（别名会漂移）"
+  },
+  "jev_prompts": {
+    "description": "Jev 判断题提示词",
+    "type": "object",
+    "hint": "judge_mode=jev 时发给 Jev 的六道判断题，建议用英文。题目键名固定只改内容；Score 题的五档标准必须正好 5 条。判断日志开 DEBUG 可看到完整请求体",
+    "items": {
+      "should_reply": {
+        "description": "总判断 Noul（触发信号）",
+        "type": "object",
+        "items": {
+          "instructions": {
+            "description": "题干",
+            "type": "text",
+            "default": "You are deciding whether the bot should proactively speak in a group chat. current_messages holds the new messages since the bot last considered speaking, in order. Judge them together as one moment, not one by one. The bot's name and identity are given in the persona. Answer YES only when at least one of these new messages is directed at the bot: it calls the bot by name or nickname, asks the bot a question, responds to something the bot previously said, or explicitly invites the bot to join or invites another member to interact with the bot. Answer NO when the messages address a different name (another bot or another member), and NO when the bot is merely the topic of banter or commentary between members without anyone engaging the bot. Answer NO for everything else: conversations between other members, people thinking aloud, and emotional venting not addressed to the bot, even if joining in would feel natural. When in doubt, answer NO."
+          },
+          "criteria_true": {
+            "description": "判「是」的标准",
+            "type": "string",
+            "default": "At least one new message speaks to the bot by name or nickname, continues the bot's own thread, or invites interaction with the bot"
+          },
+          "criteria_false": {
+            "description": "判「否」的标准",
+            "type": "string",
+            "default": "The new messages are all for someone else or another bot, or only talk about the bot without engaging it"
+          }
+        }
+      },
+      "relevance": {
+        "description": "内容相关度 Score（仅观测）",
+        "type": "object",
+        "items": {
+          "instructions": {
+            "description": "题干",
+            "type": "text",
+            "default": "current_messages holds the new messages since the bot last considered speaking, in order. Judge them together as one moment, not one by one. How relevant are they to the bot's persona, and does the persona have something genuine to contribute?"
+          },
+          "criteria": {
+            "description": "五档标准（第 1 条 = 0 分，第 5 条 = 4 分）",
+            "type": "list",
+            "default": [
+              "Completely irrelevant: random chatter the persona has no stake in, or content it could not meaningfully respond to",
+              "Mostly irrelevant: generic small talk with nothing for the persona to hook onto",
+              "Somewhat relevant: the persona could respond, but would add little value",
+              "Clearly relevant: matches the persona's interests or expertise, and the persona has something real to contribute",
+              "Directly relevant: the message explicitly invites this persona's participation, e.g. asks the kind of question this persona would answer or touches its core interests"
+            ]
+          }
+        }
+      },
+      "willingness": {
+        "description": "回复意愿 Score（仅观测）",
+        "type": "object",
+        "items": {
+          "instructions": {
+            "description": "题干",
+            "type": "text",
+            "default": "Setting aside the bot's energy level (which the application handles separately), how much would this persona want to join in on what the current_messages are about?"
+          },
+          "criteria": {
+            "description": "五档标准（第 1 条 = 0 分，第 5 条 = 4 分）",
+            "type": "list",
+            "default": [
+              "No interest at all: the topic leaves the persona completely cold",
+              "Little interest: the persona would have nothing to say about this topic",
+              "Mild interest: the persona could take it or leave it",
+              "Interested: the persona would enjoy talking about this topic",
+              "Strong interest: the topic is exactly what this persona loves to talk about"
+            ]
+          }
+        }
+      },
+      "social": {
+        "description": "社交适宜性 Score（仅观测）",
+        "type": "object",
+        "items": {
+          "instructions": {
+            "description": "题干",
+            "type": "text",
+            "default": "After the current_messages, how socially appropriate would a reply from the bot be? Messages clearly exchanged between other members must score low."
+          },
+          "criteria": {
+            "description": "五档标准（第 1 条 = 0 分，第 5 条 = 4 分）",
+            "type": "list",
+            "default": [
+              "Socially wrong: the message is part of a private exchange between other members, or an emotional moment the bot should not intrude on",
+              "Poor fit: a reply would interrupt the current flow between members",
+              "Neutral: a reply would be neither welcome nor intrusive",
+              "Good fit: the conversation is open and a bot reply would feel natural",
+              "Ideal: the group is waiting for someone to respond, or the message openly invites any member to chime in"
+            ]
+          }
+        }
+      },
+      "timing": {
+        "description": "时机 Score（仅观测）",
+        "type": "object",
+        "items": {
+          "instructions": {
+            "description": "题干",
+            "type": "text",
+            "default": "Given minutes_since_last_reply, is the moment right after the current_messages a good time for the bot to speak again? Speaking too soon after the last reply is spammy."
+          },
+          "criteria": {
+            "description": "五档标准（第 1 条 = 0 分，第 5 条 = 4 分）",
+            "type": "list",
+            "default": [
+              "Terrible timing: the bot just spoke and speaking again now would be spammy",
+              "Too soon: the bot replied within the last few minutes",
+              "Acceptable: some time has passed since the bot's last reply",
+              "Good: it has been a while since the bot last spoke",
+              "Perfect: the bot has not replied for a long time, or has never replied in this chat"
+            ]
+          }
+        }
+      },
+      "continuity": {
+        "description": "连贯性 Score（仅观测）",
+        "type": "object",
+        "items": {
+          "instructions": {
+            "description": "题干",
+            "type": "text",
+            "default": "How strongly are the current_messages connected to the bot's last reply? When there is no previous bot reply, treat the connection as neutral (middle)."
+          },
+          "criteria": {
+            "description": "五档标准（第 1 条 = 0 分，第 5 条 = 4 分）",
+            "type": "list",
+            "default": [
+              "Totally disconnected: a new topic with zero relation to anything the bot said; jumping in would feel random",
+              "Weak link: only a superficial connection to the bot's last reply",
+              "Neutral: no previous bot reply exists, or the connection is neither strong nor weak",
+              "Clear link: the message follows up on the bot's last reply or stays on the same topic",
+              "Direct continuation: the message explicitly responds to or quotes the bot's last reply"
+            ]
+          }
+        }
+      }
+    }
   }
 }

@@ -171,13 +171,13 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["text"] for m in state["current_messages"]], ["当前消息"])
         self.assertEqual(state["persona"], "no persona set")
 
-    async def test_persona_truncated_when_no_summary_provider(self):
-        plugin = self._plugin()
+    async def test_full_persona_sent_when_compression_off(self):
+        plugin = self._plugin(judge_provider_name="judge")
         plugin._get_persona_system_prompt = AsyncMock(return_value="x" * 1000)
         state = await plugin._build_jev_state(
             _Event(), plugin._get_chat_state("test:GroupMessage:10001")
         )
-        self.assertEqual(len(state["persona"]), 400)
+        self.assertEqual(state["persona"], "x" * 1000)
 
     async def test_llm_mode_still_routes_to_llm(self):
         plugin = self._plugin(judge_mode="llm")
