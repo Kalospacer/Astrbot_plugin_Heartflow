@@ -28,7 +28,7 @@
     "description": "回复阈值(0-1)",
     "type": "float",
     "default": 0.6,
-    "hint": "超过此阈值才会主动回复，值越高越严格。judge_mode=llm 时比较的是五维加权综合分，judge_mode=jev 时比较的是 noul 概率",
+    "hint": "超过此阈值才会主动回复，值越高越严格。llm 模式与 jev 的 score 模式比较的是五维加权综合分，jev 的 noul 模式比较的是 noul 概率",
     "slider": {
       "min": 0,
       "max": 1,
@@ -233,13 +233,21 @@
     "default": "jev-1.13.0",
     "hint": "锁定版本保证判断可复现；填 jev-latest 则跟随官方最新（别名会漂移）"
   },
+  "jev_decision_mode": {
+    "description": "Jev 判断模式",
+    "type": "string",
+    "default": "noul",
+    "options": ["noul", "score"],
+    "labels": ["Noul 总判断", "五维 Score 加权"],
+    "hint": "noul：只问一道「该不该回复」，用校准概率和阈值比较；score：只问五维五道题，按评分权重加权成综合分和阈值比较。每种模式只发自己要用的题"
+  },
   "jev_prompts": {
     "description": "Jev 判断题提示词",
     "type": "object",
-    "hint": "judge_mode=jev 时发给 Jev 的六道判断题，建议用英文。题目键名固定只改内容；Score 题的五档标准必须正好 5 条。判断日志开 DEBUG 可看到完整请求体",
+    "hint": "judge_mode=jev 时发给 Jev 的判断题，建议用英文。noul 模式只发总判断，score 模式只发五维。题目键名固定只改内容；Score 题的五档标准必须正好 5 条。判断日志开 DEBUG 可看到完整请求体",
     "items": {
       "should_reply": {
-        "description": "总判断 Noul（触发信号）",
+        "description": "总判断 Noul（noul 模式）",
         "type": "object",
         "items": {
           "instructions": {
@@ -260,7 +268,7 @@
         }
       },
       "relevance": {
-        "description": "内容相关度 Score（仅观测）",
+        "description": "内容相关度 Score（score 模式）",
         "type": "object",
         "items": {
           "instructions": {
@@ -282,7 +290,7 @@
         }
       },
       "willingness": {
-        "description": "回复意愿 Score（仅观测）",
+        "description": "回复意愿 Score（score 模式）",
         "type": "object",
         "items": {
           "instructions": {
@@ -304,7 +312,7 @@
         }
       },
       "social": {
-        "description": "社交适宜性 Score（仅观测）",
+        "description": "社交适宜性 Score（score 模式）",
         "type": "object",
         "items": {
           "instructions": {
@@ -326,7 +334,7 @@
         }
       },
       "timing": {
-        "description": "时机 Score（仅观测）",
+        "description": "时机 Score（score 模式）",
         "type": "object",
         "items": {
           "instructions": {
@@ -348,7 +356,7 @@
         }
       },
       "continuity": {
-        "description": "连贯性 Score（仅观测）",
+        "description": "连贯性 Score（score 模式）",
         "type": "object",
         "items": {
           "instructions": {

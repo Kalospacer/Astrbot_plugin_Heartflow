@@ -17,13 +17,16 @@
 
 ## Jev 判断引擎（judge_mode=jev）
 
-[TypeSafe Jev](https://typesafe.ai/) 是判断专用模型：一次请求并行评估一道总判断 Noul 加五维 Score 观测题。Noul 返回校准过的"该不该回复"概率，直接作为触发信号（`reply_threshold` 作用于它）；五维 Score（内容、意愿、社交、时机、连贯）只记入日志用于观测调参，不参与触发决策；Noul 缺失时回退五维加权。按输入 token 计费（$0.042/Mtok），输出免费。
+[TypeSafe Jev](https://typesafe.ai/) 是判断专用模型，按输入 token 计费（$0.042/Mtok），输出免费。`jev_decision_mode` 二选一，每种模式只发自己要用的题：
+
+- `noul`（默认）：只问一道总判断 Noul，Jev 返回校准过的"该不该回复"概率，直接和 `reply_threshold` 比较。
+- `score`：只问五维 Score（内容、意愿、社交、时机、连贯，各 0-4 档），折算成 0-10 分后按评分权重加权成 0-1 综合分，和 `reply_threshold` 比较。
 
 配置方式：
 
 1. 将 `judge_mode` 设为 `jev`。
 2. 填写 `jev_api_key`（TypeSafe 控制台获取），或设置环境变量 `TYPESAFE_API_KEY`。
-3. `reply_threshold` 即 Noul 概率阈值，建议从 0.6 起步观察日志调整。
+3. 选择 `jev_decision_mode`；`reply_threshold` 在 noul 模式下是概率阈值，在 score 模式下是加权综合分阈值，建议从 0.6 起步观察日志调整。
 
 注意：
 
@@ -32,8 +35,8 @@
 - 六道判断题的题干和档位标准在配置 `jev_prompts` 里可改（题目键名固定，Score 题必须 5 档）。
 - 日志级别为 DEBUG 时，每次判断都会打印 `Jev 请求体: {...}`，即发给 Jev 的完整 JSON（不含 API key）。
 - 官方模型别名 `jev-latest` 会漂移，默认锁定 `jev-1.13.0` 保证判断可复现；判断日志会记录实际响应的模型版本号。
-- Jev 官方提示中文准确率目前低于英语，建议上线后观察判断日志（每条含 noul 概率、五维分数与五维加权 `5dim=`），必要时调整 `reply_threshold`。
-- 判断结果里的 `overall_score` 统一表示"实际参与阈值比较的那个数"：`llm` 模式是五维加权综合分，`jev` 模式是 noul 概率（回退时才是五维加权），所以触发日志的 `评分:` 在两种模式下都能直接和阈值对照。
+- Jev 官方提示中文准确率目前低于英语，建议上线后观察判断日志（noul 模式含 `noul=`，score 模式含五维分数与 `min_conf=`），必要时调整 `reply_threshold`。
+- 判断结果里的 `overall_score` 统一表示"实际参与阈值比较的那个数"：`llm` 模式是五维加权综合分，`jev` 的 noul 模式是 noul 概率、score 模式是五维加权综合分，所以触发日志的 `评分:` 在两种模式下都能直接和阈值对照。
 - 国内服务器需确认到 `api.typesafe.ai` 的网络可达性；不可达时为 AstrBot 进程配置 `https_proxy`。
 
 ## 兼容性
@@ -89,9 +92,10 @@ git clone https://github.com/advent259141/Astrbot_plugin_Heartflow.git
 | `judge_mode` | `llm` | 判断引擎：`llm` 小参数模型 / `jev` TypeSafe Jev |
 | `jev_api_key` | 空 | Jev API key；留空读环境变量 `TYPESAFE_API_KEY` |
 | `jev_model` | `jev-1.13.0` | Jev 模型版本（锁版本可复现，`jev-latest` 跟随官方） |
+| `jev_decision_mode` | `noul` | Jev 判断模式：`noul` 总判断概率 / `score` 五维加权 |
 | `jev_prompts` | 内置六题 | Jev 判断题的题干与档位标准 |
 
-五项评分权重默认分别为：内容相关度 25%、回复意愿 20%、社交适宜性 20%、时机 15%、连贯性 20%。权重不必手动保证总和为 1，插件会自动归一化；全部为 0 时会回退到默认权重。注意：权重只在 `judge_mode=llm` 时参与触发决策；`judge_mode=jev` 时决策由 Noul 概率做出，权重仅影响观测日志中的综合分。
+五项评分权重默认分别为：内容相关度 25%、回复意愿 20%、社交适宜性 20%、时机 15%、连贯性 20%。权重不必手动保证总和为 1，插件会自动归一化；全部为 0 时会回退到默认权重。权重在 `judge_mode=llm` 和 Jev 的 score 模式下参与触发决策；Jev 的 noul 模式不使用权重。
 
 ## 判断防抖（debounce_seconds）
 

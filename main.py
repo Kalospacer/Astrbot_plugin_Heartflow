@@ -130,26 +130,32 @@ def _get_str_config(config, key: str, default: str = "") -> str:
 _SCORE_NAMES = ("relevance", "willingness", "social", "timing", "continuity")
 
 
-def _build_jev_questions(prompts: dict) -> dict:
-    """把 jev_prompts 配置组装成 Jev 的六道题：五维 Score（0-4 档）+ 一道总 Noul。
+def _build_jev_questions(prompts: dict, mode: str) -> dict:
+    """按判断模式把 jev_prompts 配置组装成发给 Jev 的题目，只发该模式要用的题。
 
+    noul：一道总判断 Noul；score：五维 Score（0-4 档）。
     题干和每档边界都在 _conf_schema.json 里，语义边界交给模型，不用正则词表。
     """
-    questions = {
-        name: {
-            "type": "score",
-            "instructions": prompts[name]["instructions"],
-            "criteria": list(prompts[name]["criteria"]),
+    if mode == "score":
+        return {
+            name: {
+                "type": "score",
+                "instructions": prompts[name]["instructions"],
+                "criteria": list(prompts[name]["criteria"]),
+            }
+            for name in _SCORE_NAMES
         }
-        for name in _SCORE_NAMES
-    }
     noul = prompts["should_reply"]
-    questions["should_reply"] = {
-        "type": "noul",
-        "instructions": noul["instructions"],
-        "criteria": {"true": noul["criteria_true"], "false": noul["criteria_false"]},
+    return {
+        "should_reply": {
+            "type": "noul",
+            "instructions": noul["instructions"],
+            "criteria": {
+                "true": noul["criteria_true"],
+                "false": noul["criteria_false"],
+            },
+        }
     }
-    return questions
 
 
 class HeartflowPlugin(star.Star):
@@ -214,7 +220,12 @@ class HeartflowPlugin(star.Star):
             self.config, "jev_base_url", "https://api.typesafe.ai"
         ).rstrip("/")
         self.jev_model = _get_str_config(self.config, "jev_model", "jev-1.13.0")
-        self.jev_questions = _build_jev_questions(self.config["jev_prompts"])
+        self.jev_decision_mode = _get_str_config(
+            self.config, "jev_decision_mode", "noul"
+        ).lower()
+        self.jev_questions = _build_jev_questions(
+            self.config["jev_prompts"], self.jev_decision_mode
+        )
         self._jev_client: httpx.AsyncClient | None = None
 
         # 群聊状态管理
@@ -725,49 +736,48 @@ class HeartflowPlugin(star.Star):
             usage.get("input_tokens", "?") if isinstance(usage, dict) else "?"
         )
 
-        scores_10: dict[str, float] = {}
-        confidences: dict[str, float] = {}
-        for name in _SCORE_NAMES:
-            ans = answers.get(name)
-            if not isinstance(ans, dict):
-                return self._jev_fail(f"Jev 响应缺题 {name}")
-            raw = ans.get("score")
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                return self._jev_fail(f"Jev {name} score 非法: {raw!r}")
-            raw = float(raw)
-            if not 0.0 <= raw <= 4.0:  # nan/inf 也会落到这里
-                return self._jev_fail(f"Jev {name} score 越界: {raw}")
-            scores_10[name] = raw / 4.0 * 10.0
-            conf = ans.get("confidence")
-            if isinstance(conf, (int, float)) and not isinstance(conf, bool):
-                confidences[name] = float(conf)
+        if self.jev_decision_mode == "score":
+            # 五维模式：五道 Score 按权重加权成 0-1 综合分，和阈值比较
+            scores_10: dict[str, float] = {}
+            confidences: dict[str, float] = {}
+            for name in _SCORE_NAMES:
+                ans = answers.get(name)
+                if not isinstance(ans, dict):
+                    return self._jev_fail(f"Jev 响应缺题 {name}")
+                raw = ans.get("score")
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    return self._jev_fail(f"Jev {name} score 非法: {raw!r}")
+                raw = float(raw)
+                if not 0.0 <= raw <= 4.0:  # nan/inf 也会落到这里
+                    return self._jev_fail(f"Jev {name} score 越界: {raw}")
+                scores_10[name] = raw / 4.0 * 10.0
+                conf = ans.get("confidence")
+                if isinstance(conf, (int, float)) and not isinstance(conf, bool):
+                    confidences[name] = float(conf)
+            signal = self._weighted_overall(scores_10)
+            reasoning = (
+                f"by=score rel={scores_10['relevance']:.1f} "
+                f"wil={scores_10['willingness']:.1f} soc={scores_10['social']:.1f} "
+                f"tim={scores_10['timing']:.1f} con={scores_10['continuity']:.1f}"
+                + (
+                    f" | min_conf={min(confidences.values()):.2f}"
+                    if confidences
+                    else ""
+                )
+            )
+        else:
+            # noul 模式：Jev 校准过的"该不该回复"概率直接和阈值比较
+            scores_10 = {}
+            ans = answers.get("should_reply")
+            noul = ans.get("noul") if isinstance(ans, dict) else None
+            if isinstance(noul, bool) or not isinstance(noul, (int, float)):
+                return self._jev_fail(f"Jev noul 非法: {noul!r}")
+            if not 0.0 <= noul <= 1.0:  # nan/inf 也会落到这里
+                return self._jev_fail(f"Jev noul 越界: {noul}")
+            signal = float(noul)
+            reasoning = f"by=noul noul={signal:.2f}"
 
-        noul_ans = answers.get("should_reply")
-        noul = None
-        if isinstance(noul_ans, dict):
-            n = noul_ans.get("noul")
-            if (
-                isinstance(n, (int, float))
-                and not isinstance(n, bool)
-                and math.isfinite(float(n))
-            ):
-                noul = max(0.0, min(1.0, float(n)))
-
-        # 决策信号是 noul（Jev 校准概率）；五维加权仅作观测。
-        # noul 缺失/非法时回退五维加权，保守可用。
-        five_dim = self._weighted_overall(scores_10)
-        signal = noul if noul is not None else five_dim
         should_reply = signal >= self.reply_threshold
-
-        min_conf = min(confidences.values()) if confidences else 0.0
-        reasoning = (
-            f"by={'noul' if noul is not None else '5dim-fallback'} "
-            f"rel={scores_10['relevance']:.1f} wil={scores_10['willingness']:.1f} "
-            f"soc={scores_10['social']:.1f} tim={scores_10['timing']:.1f} "
-            f"con={scores_10['continuity']:.1f} 5dim={five_dim:.2f}"
-            + (f" | noul={noul:.2f}" if noul is not None else " | noul=缺失")
-            + (f" | min_conf={min_conf:.2f}" if confidences else "")
-        )
 
         logger.info(
             f"Jev 判断 | {event.unified_msg_origin[:20]}... | 信号:{signal:.3f} "
@@ -1244,11 +1254,17 @@ class HeartflowPlugin(star.Star):
         chat_state = self._get_chat_state(chat_id)
 
         if self.judge_mode == "jev":
+            decision = (
+                "五维 Score 加权综合分"
+                if self.jev_decision_mode == "score"
+                else "Noul 总判断概率"
+            )
             engine_lines = [
                 "- 引擎: TypeSafe Jev",
                 f"- 模型: {self.jev_model}",
                 f"- API key: {'✅ 已配置' if self._jev_key() else '❌ 未配置'}",
-                f"- 回复阈值: {self.reply_threshold}（noul 概率，五维分数仅观测）",
+                f"- 判断模式: {decision}",
+                f"- 回复阈值: {self.reply_threshold}（比较的是{decision}）",
             ]
         else:
             engine_lines = [

@@ -54,54 +54,47 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
             result = await plugin._judge_with_jev(_Event())
         return result, client
 
-    async def test_noul_is_the_decision_signal(self):
-        # 五维中等（overall 0.5 < 0.6）但 noul 0.9 ≥ 0.6 → 触发（noul 决定）
+    async def test_noul_mode_decides_by_noul_and_sends_only_noul(self):
         plugin = self._plugin()
-        mid = {n: 2.0 for n in _SCORE_NAMES}
-        result, _ = await self._run_judge(
-            plugin, [_JevResp(200, _jev_payload(score_map=mid, noul=0.9))]
+        result, client = await self._run_judge(
+            plugin, [_JevResp(200, _jev_payload(noul=0.9))]
         )
-        self.assertIn("5dim=0.50", result.reasoning)
         self.assertTrue(result.should_reply)
         self.assertAlmostEqual(result.overall_score, 0.9)
-        self.assertAlmostEqual(result.confidence, 0.9)
         self.assertIn("by=noul", result.reasoning)
-        self.assertIn("noul=0.90", result.reasoning)
+        sent = client.post.await_args.kwargs["json"]["questions"]
+        self.assertEqual(list(sent), ["should_reply"])
 
-        # 五维满分（overall 1.0）但 noul 0.3 < 0.6 → 不触发
         plugin = self._plugin()
-        high = {n: 4.0 for n in _SCORE_NAMES}
         result, _ = await self._run_judge(
-            plugin, [_JevResp(200, _jev_payload(score_map=high, noul=0.3))]
+            plugin, [_JevResp(200, _jev_payload(noul=0.3))]
         )
-        self.assertIn("5dim=1.00", result.reasoning)
         self.assertAlmostEqual(result.overall_score, 0.3)
         self.assertFalse(result.should_reply)
 
-    async def test_missing_noul_falls_back_to_five_dimensions(self):
-        # noul 缺失时回退五维加权：overall 0.8 ≥ 0.6 → 触发，日志标注 fallback
+    async def test_noul_mode_missing_noul_fails(self):
         plugin = self._plugin()
-        high = {n: 3.2 for n in _SCORE_NAMES}
         result, _ = await self._run_judge(
-            plugin, [_JevResp(200, _jev_payload(score_map=high, noul=None))]
+            plugin, [_JevResp(200, _jev_payload(noul=None))]
+        )
+        self.assertFalse(result.should_reply)
+        self.assertIn("noul 非法", result.reasoning)
+
+    async def test_score_mode_decides_by_weighted_scores(self):
+        plugin = self._plugin(jev_decision_mode="score")
+        high = {n: 3.2 for n in _SCORE_NAMES}
+        conf = {n: 0.95 for n in _SCORE_NAMES}
+        conf["social"] = 0.0
+        result, client = await self._run_judge(
+            plugin,
+            [_JevResp(200, _jev_payload(score_map=high, conf_map=conf))],
         )
         self.assertAlmostEqual(result.overall_score, 0.8)
         self.assertTrue(result.should_reply)
-        self.assertIn("noul=缺失", result.reasoning)
-        self.assertIn("5dim-fallback", result.reasoning)
-
-    async def test_low_confidence_does_not_block_decision(self):
-        # 维度置信度仅作观测：某维 conf 极低不影响 noul 决策
-        plugin = self._plugin()
-        high = {n: 4.0 for n in _SCORE_NAMES}
-        conf = {n: 0.95 for n in _SCORE_NAMES}
-        conf["social"] = 0.0
-        result, _ = await self._run_judge(
-            plugin,
-            [_JevResp(200, _jev_payload(score_map=high, noul=0.9, conf_map=conf))],
-        )
-        self.assertTrue(result.should_reply)
+        self.assertIn("by=score", result.reasoning)
         self.assertIn("min_conf=0.00", result.reasoning)
+        sent = client.post.await_args.kwargs["json"]["questions"]
+        self.assertEqual(list(sent), list(_SCORE_NAMES))
 
     async def test_429_backoff_then_success(self):
         plugin = self._plugin()
@@ -128,7 +121,7 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
         client.post.assert_not_awaited()
 
     async def test_missing_question_in_answers_fails(self):
-        plugin = self._plugin()
+        plugin = self._plugin(jev_decision_mode="score")
         payload = _jev_payload(noul=0.9)
         del payload["answers"]["continuity"]
         result, _ = await self._run_judge(plugin, [_JevResp(200, payload)])
@@ -136,7 +129,7 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("缺题", result.reasoning)
 
     async def test_score_out_of_range_fails(self):
-        plugin = self._plugin()
+        plugin = self._plugin(jev_decision_mode="score")
         bad = {n: 3.0 for n in _SCORE_NAMES}
         bad["timing"] = 5.0  # 超出 0-4 档
         result, _ = await self._run_judge(
