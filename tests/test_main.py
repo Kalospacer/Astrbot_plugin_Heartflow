@@ -159,8 +159,8 @@ _SCHEMA = json.loads(
 
 
 def _config(**overrides):
-    config = {
-        "jev_prompts": _schema_defaults(_SCHEMA["jev_prompts"]["items"]),
+    config = _schema_defaults(_SCHEMA)
+    config |= {
         "enable_heartflow": True,
         "judge_provider_name": "judge",
         "judge_max_retries": 1,
@@ -179,20 +179,14 @@ class _Response:
 
 
 class HeartflowStateTests(unittest.IsolatedAsyncioTestCase):
-    def test_zero_weights_fall_back_to_defaults(self):
-        plugin = heartflow.HeartflowPlugin(
-            _Context(),
-            _config(
-                judge_relevance=0,
-                judge_willingness=0,
-                judge_social=0,
-                judge_timing=0,
-                judge_continuity=0,
-            ),
-        )
+    def test_zero_weights_fall_back_to_equal_weights(self):
+        config = _config()
+        for dimension in config["score_dimensions"]:
+            dimension["weight"] = 0
+        plugin = heartflow.HeartflowPlugin(_Context(), config)
 
         self.assertAlmostEqual(sum(plugin.weights.values()), 1.0)
-        self.assertEqual(plugin.weights["relevance"], 0.25)
+        self.assertAlmostEqual(plugin.weights["relevance"], 0.2)
 
     def test_reading_state_does_not_reset_last_reply_time(self):
         plugin = heartflow.HeartflowPlugin(
@@ -417,7 +411,7 @@ class HeartflowJudgeTests(unittest.IsolatedAsyncioTestCase):
                 self.calls = []
                 self.responses = [
                     "[]",
-                    '{"relevance": 8, "willingness": 8, "social": 8, "timing": 8, "continuity": 8}',
+                    '{"relevance": 3.2, "willingness": 3.2, "social": 3.2, "timing": 3.2, "continuity": 3.2}',
                 ]
 
             async def text_chat(self, **kwargs):
@@ -447,9 +441,9 @@ class HeartflowJudgeTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = 0
                 self.responses = [
-                    '{"relevance": true, "willingness": 8, "social": 8, "timing": 8, "continuity": 8}',
-                    '{"relevance": 11, "willingness": 8, "social": 8, "timing": 8, "continuity": 8}',
-                    '{"relevance": 8, "willingness": 8, "social": 8, "timing": 8, "continuity": 8}',
+                    '{"relevance": true, "willingness": 3.2, "social": 3.2, "timing": 3.2, "continuity": 3.2}',
+                    '{"relevance": 5, "willingness": 3.2, "social": 3.2, "timing": 3.2, "continuity": 3.2}',
+                    '{"relevance": 3.2, "willingness": 3.2, "social": 3.2, "timing": 3.2, "continuity": 3.2}',
                 ]
 
             async def text_chat(self, **_kwargs):

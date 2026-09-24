@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from test_main import _config, _Context, _Event, heartflow
 
-_SCORE_NAMES = heartflow._SCORE_NAMES
+_SCORE_NAMES = tuple(d["key"] for d in _config()["score_dimensions"])
 
 
 class _JevResp:
@@ -144,7 +144,7 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
         plugin._record_raw_message(_Event(message="上一条消息"))
         plugin._record_bot_message(event.unified_msg_origin, "bot 上次回复")
         plugin._record_raw_message(event)
-        state = await plugin._build_jev_state(
+        state = await plugin._build_judge_state(
             event, plugin._get_chat_state(event.unified_msg_origin)
         )
         for key in (
@@ -167,7 +167,7 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_persona_sent_when_compression_off(self):
         plugin = self._plugin(judge_provider_name="judge")
         plugin._get_persona_system_prompt = AsyncMock(return_value="x" * 1000)
-        state = await plugin._build_jev_state(
+        state = await plugin._build_judge_state(
             _Event(), plugin._get_chat_state("test:GroupMessage:10001")
         )
         self.assertEqual(state["persona"], "x" * 1000)

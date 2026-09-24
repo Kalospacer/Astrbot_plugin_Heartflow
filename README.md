@@ -18,15 +18,16 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 
 | | `llm` | `jev` + `noul` | `jev` + `score` |
 | --- | --- | --- | --- |
-| 发出的内容 | 系统提示词 + JSON 用户消息，要求返回五维 0-10 分 | 1 道 Noul 题 `should_reply` | 5 道 Score 题（0-4 档） |
-| 和 `reply_threshold` 比较的数 | 五维加权综合分 | Noul 概率 | 五维折算 0-10 后的加权综合分 |
+| 发出的内容 | 系统提示词 + JSON 用户消息，要求每个评分维度返回 0-4 分 | 1 道 Noul 题 `should_reply` | 每个评分维度一道 Score 题（0-4 档） |
+| 和 `reply_threshold` 比较的数 | 维度加权综合分 | Noul 概率 | 维度加权综合分 |
 | 评分权重 | 生效 | 不使用 | 生效 |
 | `judge_max_retries` 重试的是 | 无效 JSON | 429/529 限流、网络错误 | 同左 |
 | 判断失败 | 本条不触发 | 本条不触发，打 warning | 同左 |
 
-- 判断器看到的输入：人格、精力、距上次回复分钟数、群聊摘要（近 10 分钟活跃度、历史回复率、当前时间）、`chat_log`（本批之前的最近 `judge_context_count` 条）、机器人上次回复、`current_messages`（本批新消息）
+- 两个引擎的输入相同：`persona`、`bot_energy`、`minutes_since_last_reply`、`chat_activity`（近 10 分钟活跃度、历史回复率、当前时间）、`chat_log`（本批之前的最近 `judge_context_count` 条）、`bot_last_reply`、`current_messages`（本批新消息）
+- 综合分 = Σ(维度分 / 4 × 归一化权重)，范围 0-1
+- LLM 系统提示词 = `llm_judge_preamble` + 由 `score_dimensions` 生成的打分标准 + 按维度 key 生成的 JSON 输出格式（后两段不可编辑）
 - Jev 请求：`POST {jev_base_url}/v1/systemone`，body 为 `{"model", "state", "questions"}`；日志级别为 DEBUG 时打印整个请求体 `Jev 请求体: {...}`（不含 API key）
-- Jev 判断题的题干与档位标准在 `jev_prompts` 里编辑；题目键名固定，Score 题必须正好 5 条标准
 
 ## 配置
 
@@ -57,18 +58,26 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 | `compressed_persona` | 空 | 压缩人格，可手动编辑；开启压缩且本项为空时，用 `judge_provider_name` 压缩一次并写回本项 |
 | `judge_provider_name` | 空 | LLM 判断的模型；也是自动压缩人格所用的模型 |
 
+### 评分维度
+
+`score_dimensions` 是可增删的列表，`llm` 与 Jev 的 `score` 模式共用。默认预置 5 个维度：
+
+| `key` | 名称 | 权重 |
+| --- | --- | --- |
+| `relevance` | 内容相关度 | `0.25` |
+| `willingness` | 回复意愿 | `0.2` |
+| `social` | 社交适宜性 | `0.2` |
+| `timing` | 时机 | `0.15` |
+| `continuity` | 连贯性 | `0.2` |
+
+每个维度的字段：`key`（英文标识，模型输出与 Jev 题目名都用它，互不重复，不能用 `should_reply`）、`name`、`weight`（`0-1`，自动归一化，全为 0 时等权）、`instructions`（题干）、`criteria`（正好 5 条，依次对应 0-4 分）。
+
 ### LLM 引擎
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `judge_relevance` | `0.25` | 权重：内容相关度 |
-| `judge_willingness` | `0.2` | 权重：回复意愿 |
-| `judge_social` | `0.2` | 权重：社交适宜性 |
-| `judge_timing` | `0.15` | 权重：时机 |
-| `judge_continuity` | `0.2` | 权重：连贯性 |
+| `llm_judge_preamble` | 内置中文说明 | 系统提示词开头：角色、防注入说明、输入字段含义 |
 | `judge_include_reasoning` | `true` | 要求判断模型附带 `reasoning` |
-
-权重同样作用于 Jev 的 score 模式。总和不为 1 时自动归一化，全部为 0 时回退默认值。
 
 ### Jev 引擎
 
@@ -78,7 +87,7 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 | `jev_base_url` | `https://api.typesafe.ai` | 国内不可达时可换成反代地址 |
 | `jev_model` | `jev-1.13.0` | 锁定版本，保证判断可复现；`jev-latest` 会漂移 |
 | `jev_decision_mode` | `noul` | `noul` / `score`，每种模式只发自己的题 |
-| `jev_prompts` | 内置英文题目 | 各题的 `instructions`、`criteria` / `criteria_true` / `criteria_false` |
+| `jev_noul_question` | 内置英文题目 | noul 模式的唯一一道题：`instructions`、`criteria_true`、`criteria_false` |
 
 ## 批次与防抖
 
@@ -92,7 +101,7 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 
 仅管理员可用：
 
-- `/heartflow`：当前群的精力、统计、引擎、判断模式、人格压缩状态、权重
+- `/heartflow`：当前群的精力、统计、引擎、判断模式、人格压缩状态、评分维度与权重
 - `/heartflow_reset`：清空当前群的状态和消息缓冲
 - `/heartflow_cache`：查看 `compressed_persona`
 - `/heartflow_cache_clear`：清空 `compressed_persona`，下次判断重新压缩
@@ -103,7 +112,7 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 
 `event.get_extra("heartflow_triggered")  # bool`
 
-`event.get_extra("heartflow_judge_result")  # JudgeResult: relevance/willingness/social/timing/continuity(0-10), overall_score, reasoning, should_reply`
+`event.get_extra("heartflow_judge_result")  # JudgeResult: overall_score, reasoning, should_reply, scores: dict[维度 key, 0-4]（noul 模式为空）`
 
 `event.get_extra("heartflow_batch")  # list[RawMessage]: sender_name, sender_id, content, timestamp, is_bot`
 
@@ -111,7 +120,7 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 
 ## 注意事项
 
-- 精力不会直接拦截回复，只作为判断器的输入；noul 模式的题目不看精力
+- 精力不会直接拦截回复，只作为 `bot_energy` 输入判断器；默认题目都不看精力（`willingness` 题干明确排除了精力），要让精力参与判断就改题干
 - @ 机器人或唤醒词触发的消息不经过心流判断，也不受防抖影响；它们仍会写入缓冲，其回复计入冷却和「距上次回复」
 - 斜杠命令既不判断也不写入缓冲
 - 触发时，群聊记录和本批消息以临时内容块 `extra_user_content_parts`（`mark_as_temp`）交给主 LLM：不改 `system_prompt`，也不写入会话历史
