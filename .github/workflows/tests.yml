@@ -21,7 +21,7 @@ jobs:
         run: python -m pip install ruff==0.14.11 -r requirements.txt
       - name: Lint and format check
         run: |
-          ruff check main.py tests
-          ruff format --check main.py tests
+          ruff check main.py page_api.py tests
+          ruff format --check main.py page_api.py tests
       - name: Unit tests
         run: python -m unittest discover -s tests -v

@@ -17,6 +17,8 @@ from astrbot.api.provider import Provider
 from astrbot.api import logger
 from astrbot.core.agent.message import TextPart
 
+from .page_api import HeartflowPageApi
+
 
 @dataclass
 class JudgeResult:
@@ -132,6 +134,41 @@ def _load_dimensions(config) -> list[dict]:
     ]
 
 
+def _normalize_weights(dimensions: list[dict]) -> dict[str, float]:
+    """维度权重归一化，总和为 0 时等权。"""
+    weight_sum = sum(d["weight"] for d in dimensions)
+    return {
+        d["key"]: d["weight"] / weight_sum if weight_sum > 0 else 1 / len(dimensions)
+        for d in dimensions
+    }
+
+
+def _render_llm_system_prompt(
+    preamble: str, dimensions: list[dict], include_reasoning: bool
+) -> str:
+    """LLM 判断的系统提示词：可配置的开头 + 由评分维度生成的打分标准 + 固定输出格式。
+
+    输出格式按维度 key 生成、不开放编辑，解析就是按这些 key 读分数。
+    """
+    lines = [
+        preamble,
+        "",
+        "按以下维度逐项评分，每项给 0 到 4 之间的数字，对应该维度的 0-4 档标准：",
+    ]
+    for d in dimensions:
+        lines.append(f"- {d['key']}（{d['name']}）：{d['instructions']}")
+        lines += [f"  {i}: {c}" for i, c in enumerate(d["criteria"])]
+    example = {d["key"]: 0 for d in dimensions}
+    if include_reasoning:
+        example["reasoning"] = "简短判断理由"
+    lines += [
+        "",
+        "只返回一个JSON对象，不要包含Markdown或其他文字：",
+        json.dumps(example, ensure_ascii=False),
+    ]
+    return "\n".join(lines)
+
+
 def _build_jev_questions(config, dimensions: list[dict], mode: str) -> dict:
     """按判断模式组装发给 Jev 的题目，只发该模式要用的题。
 
@@ -166,12 +203,8 @@ class HeartflowPlugin(star.Star):
 
         # 判断模型配置
         self.judge_provider_name = self.config.get("judge_provider_name", "")
-        self.compress_persona = self.config.get("compress_persona", False)
 
         # 心流参数配置
-        self.reply_threshold = _get_number_config(
-            self.config, "reply_threshold", 0.6, 0.0, 1.0
-        )
         self.energy_decay_rate = _get_number_config(
             self.config, "energy_decay_rate", 0.1, 0.0, 1.0
         )
@@ -215,15 +248,11 @@ class HeartflowPlugin(star.Star):
         )
 
         # Jev 判断引擎配置
-        self.judge_mode = _get_str_config(self.config, "judge_mode", "llm").lower()
         self.jev_api_key = _get_str_config(self.config, "jev_api_key")
         self.jev_base_url = _get_str_config(
             self.config, "jev_base_url", "https://api.typesafe.ai"
         ).rstrip("/")
         self.jev_model = _get_str_config(self.config, "jev_model", "jev-1.13.0")
-        self.jev_decision_mode = _get_str_config(
-            self.config, "jev_decision_mode", "noul"
-        ).lower()
         self._jev_client: httpx.AsyncClient | None = None
 
         # 群聊状态管理
@@ -244,29 +273,61 @@ class HeartflowPlugin(star.Star):
         self._active_reply_conflict_warned = False
 
         # 判断配置
-        self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
         self.judge_max_retries = _get_number_config(
             self.config, "judge_max_retries", 3, 0, 5, integer=True
         )
 
-        # 评分维度：llm 与 jev score 模式共用，权重归一化
+        # 最近的判断记录，供管理面板的判断日志页读取
+        self.judge_log: deque[dict] = deque(maxlen=200)
+        # 最近一次真实发出的判断请求（不含 API key），面板里查看完整请求体
+        self.last_judge_request: dict | None = None
+        self._apply_judge_config()
+        self.page_api = HeartflowPageApi(self)
+
+        logger.info("心流插件已初始化")
+
+    def _apply_judge_config(self) -> None:
+        """读取判断相关配置并生成派生状态；管理面板保存后再次调用即时生效。"""
+        self.judge_mode = _get_str_config(self.config, "judge_mode", "llm").lower()
+        self.jev_decision_mode = _get_str_config(
+            self.config, "jev_decision_mode", "noul"
+        ).lower()
+        self.reply_threshold = _get_number_config(
+            self.config, "reply_threshold", 0.6, 0.0, 1.0
+        )
+        self.compress_persona = self.config.get("compress_persona", False)
+        self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
+        # 评分维度：llm 与 jev score 模式共用
         self.dimensions = _load_dimensions(self.config)
-        weight_sum = sum(d["weight"] for d in self.dimensions)
-        if weight_sum <= 0:
-            logger.warning("评分维度权重总和为 0，改为等权")
-        self.weights = {
-            d["key"]: (
-                d["weight"] / weight_sum if weight_sum > 0 else 1 / len(self.dimensions)
-            )
-            for d in self.dimensions
-        }
-        self.llm_judge_preamble = _get_str_config(self.config, "llm_judge_preamble")
-        self.llm_system_prompt = self._build_llm_system_prompt()
+        self.weights = _normalize_weights(self.dimensions)
+        self.llm_system_prompt = _render_llm_system_prompt(
+            _get_str_config(self.config, "llm_judge_preamble"),
+            self.dimensions,
+            self.judge_include_reasoning,
+        )
         self.jev_questions = _build_jev_questions(
             self.config, self.dimensions, self.jev_decision_mode
         )
 
-        logger.info("心流插件已初始化")
+    def render_judge_preview(self, config) -> dict:
+        """按给定配置（可以是面板里未保存的草稿）生成权重、LLM 提示词和 Jev 题目预览。"""
+        dimensions = _load_dimensions(config)
+        return {
+            "weights": _normalize_weights(dimensions),
+            "llm_system_prompt": _render_llm_system_prompt(
+                _get_str_config(config, "llm_judge_preamble"),
+                dimensions,
+                config.get("judge_include_reasoning", True),
+            ),
+            "jev_questions": _build_jev_questions(
+                config,
+                dimensions,
+                _get_str_config(config, "jev_decision_mode", "noul").lower(),
+            ),
+        }
+
+    async def initialize(self):
+        self.page_api.register_routes()
 
     async def _resolve_persona_id(self, event: AstrMessageEvent) -> str | None:
         """当前会话绑定的 persona_id；没有会话或未绑定时为 None，走默认人格。
@@ -375,29 +436,6 @@ class HeartflowPlugin(star.Star):
         """各维度 0-4 分按权重折算成 0-1 的综合分。"""
         return sum(scores[key] / 4.0 * w for key, w in self.weights.items())
 
-    def _build_llm_system_prompt(self) -> str:
-        """LLM 判断的系统提示词：可配置的开头 + 由评分维度生成的打分标准 + 固定输出格式。
-
-        输出格式按维度 key 生成、不开放编辑，解析就是按这些 key 读分数。
-        """
-        lines = [
-            self.llm_judge_preamble,
-            "",
-            "按以下维度逐项评分，每项给 0 到 4 之间的数字，对应该维度的 0-4 档标准：",
-        ]
-        for d in self.dimensions:
-            lines.append(f"- {d['key']}（{d['name']}）：{d['instructions']}")
-            lines += [f"  {i}: {c}" for i, c in enumerate(d["criteria"])]
-        example = {d["key"]: 0 for d in self.dimensions}
-        if self.judge_include_reasoning:
-            example["reasoning"] = "简短判断理由"
-        lines += [
-            "",
-            "只返回一个JSON对象，不要包含Markdown或其他文字：",
-            json.dumps(example, ensure_ascii=False),
-        ]
-        return "\n".join(lines)
-
     async def judge_with_tiny_model(self, event: AstrMessageEvent) -> JudgeResult:
         """判断入口：按 judge_mode 路由到 Jev 判断引擎或小参数 LLM。"""
         if self.judge_mode == "jev":
@@ -435,10 +473,14 @@ class HeartflowPlugin(star.Star):
             )
 
         chat_state = self._get_chat_state(event.unified_msg_origin)
-        judge_prompt = json.dumps(
-            await self._build_judge_state(event, chat_state), ensure_ascii=False
-        )
+        state = await self._build_judge_state(event, chat_state)
+        judge_prompt = json.dumps(state, ensure_ascii=False)
         judge_system_prompt = self.llm_system_prompt
+        self.last_judge_request = {
+            "ts": time.time(),
+            "engine": "llm",
+            "body": {"system_prompt": judge_system_prompt, "user_message": state},
+        }
 
         try:
             # 重试机制：使用配置的重试次数
@@ -651,6 +693,11 @@ class HeartflowPlugin(star.Star):
             "questions": self.jev_questions,
         }
         logger.debug(f"Jev 请求体: {json.dumps(payload, ensure_ascii=False)}")
+        self.last_judge_request = {
+            "ts": time.time(),
+            "engine": f"jev·{self.jev_decision_mode}",
+            "body": payload,
+        }
         headers = {"Authorization": f"Bearer {api_key}"}
 
         client = self._get_jev_client()
@@ -875,6 +922,23 @@ class HeartflowPlugin(star.Star):
         """判断当前消息，命中就把事件标记成唤醒交给主 LLM。调用方需持有群聊锁。"""
         try:
             judge_result = await self.judge_with_tiny_model(event)
+            self.judge_log.append(
+                {
+                    "ts": time.time(),
+                    "umo": chat_id,
+                    "engine": (
+                        f"jev·{self.jev_decision_mode}"
+                        if self.judge_mode == "jev"
+                        else "llm"
+                    ),
+                    "signal": judge_result.overall_score,
+                    "threshold": self.reply_threshold,
+                    "triggered": judge_result.should_reply,
+                    "scores": judge_result.scores,
+                    "reasoning": judge_result.reasoning,
+                    "batch": self._format_batch(self._judge_batch(event)),
+                }
+            )
 
             if judge_result.should_reply:
                 logger.info(

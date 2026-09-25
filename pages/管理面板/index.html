@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Heartflow 管理面板</title>
+  <link rel="stylesheet" href="./app.css?v=20260925" />
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M8 16H3v5"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+  </svg>
+
+  <div class="page">
+    <header class="masthead">
+      <div class="masthead-title">
+        <h1>Heartflow</h1>
+        <p class="lede">群聊主动回复 · 判断器管理面板</p>
+      </div>
+      <dl class="status-strip" id="statusStrip" aria-label="当前运行状态"></dl>
+      <div class="masthead-actions">
+        <span class="updated" id="updatedAt" aria-live="polite">未加载</span>
+        <button type="button" class="btn btn-ghost" id="liveBtn" aria-pressed="true">
+          <svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg><span>暂停实时</span>
+        </button>
+        <button type="button" class="btn btn-ghost" id="refreshBtn">
+          <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span>刷新</span>
+        </button>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="面板分区">
+      <a class="tab" role="tab" href="#overview" data-tab="overview"><span class="tab-num">01</span>概览</a>
+      <a class="tab" role="tab" href="#log" data-tab="log"><span class="tab-num">02</span>判断日志</a>
+      <a class="tab" role="tab" href="#persona" data-tab="persona"><span class="tab-num">03</span>人格</a>
+      <a class="tab" role="tab" href="#config" data-tab="config"><span class="tab-num">04</span>判断配置</a>
+    </nav>
+
+    <main>
+      <section class="view" id="view-overview" role="tabpanel" aria-labelledby="overview">
+        <div class="kpis" id="kpis"></div>
+        <div class="section-head">
+          <h2>群聊状态</h2>
+          <p class="section-note">精力与冷却按判断时的算法实时推算；重置会清空该群的状态和消息缓冲。</p>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th scope="col">会话</th>
+                <th scope="col">精力</th>
+                <th scope="col" class="num">消息</th>
+                <th scope="col" class="num">回复</th>
+                <th scope="col">距上次回复</th>
+                <th scope="col">冷却</th>
+                <th scope="col" class="num">待判断</th>
+                <th scope="col" class="num">最近信号</th>
+                <th scope="col"><span class="sr-only">操作</span></th>
+              </tr>
+            </thead>
+            <tbody id="chatRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view" id="view-log" role="tabpanel" hidden>
+        <div class="toolbar">
+          <label class="field-inline">
+            <span>会话</span>
+            <select id="logUmo"><option value="">全部</option></select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="logTriggered" />
+            <span>仅看触发</span>
+          </label>
+          <span class="toolbar-count" id="logCount"></span>
+          <button type="button" class="btn btn-ghost" id="lastRequestBtn">最近一次请求体</button>
+        </div>
+        <pre class="code-block" id="lastRequest" hidden></pre>
+        <ol class="log-list" id="logList"></ol>
+      </section>
+
+      <section class="view" id="view-persona" role="tabpanel" hidden>
+        <div class="grid-2">
+          <div class="col">
+            <div class="section-head">
+              <h2>压缩人格</h2>
+              <p class="section-note">开启后判断器使用这份压缩人格；关闭时判断器拿人格全文。两种引擎共用。</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="compressToggle" role="switch" />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>启用人格压缩</span>
+            </label>
+            <label class="field">
+              <span class="field-label">compressed_persona <em id="compressedCount"></em></span>
+              <textarea id="compressedText" rows="12" spellcheck="false"></textarea>
+              <span class="field-help">为空且开启压缩时，下次判断会用判断模型自动压缩一次并写回这里。</span>
+            </label>
+            <div class="actions">
+              <button type="button" class="btn btn-primary" id="savePersonaBtn">保存</button>
+              <button type="button" class="btn btn-ghost" id="regenPersonaBtn">
+                <svg class="icon" aria-hidden="true"><use href="#i-reset"/></svg><span>按右侧原文重新压缩</span>
+              </button>
+            </div>
+          </div>
+          <div class="col">
+            <div class="section-head">
+              <h2>原始人格</h2>
+              <p class="section-note" id="originalMeta"></p>
+            </div>
+            <label class="field-inline">
+              <span>会话</span>
+              <select id="personaUmo"><option value="">默认配置</option></select>
+            </label>
+            <pre class="code-block tall" id="originalText"></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-config" role="tabpanel" hidden>
+        <div class="grid-config">
+          <form class="col" id="configForm" novalidate>
+            <fieldset class="block">
+              <legend>引擎</legend>
+              <div class="field-row">
+                <div class="field">
+                  <span class="field-label">judge_mode</span>
+                  <div class="segmented" role="radiogroup" aria-label="判断引擎">
+                    <label><input type="radio" name="judge_mode" value="llm" /><span>LLM</span></label>
+                    <label><input type="radio" name="judge_mode" value="jev" /><span>Jev</span></label>
+                  </div>
+                </div>
+                <div class="field">
+                  <span class="field-label">jev_decision_mode</span>
+                  <div class="segmented" role="radiogroup" aria-label="Jev 判断模式">
+                    <label><input type="radio" name="jev_decision_mode" value="noul" /><span>Noul</span></label>
+                    <label><input type="radio" name="jev_decision_mode" value="score" /><span>Score</span></label>
+                  </div>
+                </div>
+              </div>
+              <div class="field">
+                <label class="field-label" for="thresholdNum">reply_threshold</label>
+                <div class="range-row">
+                  <input type="range" id="thresholdRange" min="0" max="1" step="0.01" aria-label="回复阈值滑块" />
+                  <input type="number" id="thresholdNum" min="0" max="1" step="0.01" />
+                </div>
+                <span class="field-help">llm 与 jev·score 比较维度加权综合分；jev·noul 比较 noul 概率。</span>
+              </div>
+              <label class="check">
+                <input type="checkbox" id="includeReasoning" />
+                <span>judge_include_reasoning · LLM 附带判断理由</span>
+              </label>
+            </fieldset>
+
+            <fieldset class="block">
+              <legend>评分维度 <em class="legend-note">llm 与 jev·score 共用 · 每项 0-4 分</em></legend>
+              <div id="dimensions"></div>
+              <button type="button" class="btn btn-ghost" id="addDimBtn">
+                <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span>添加维度</span>
+              </button>
+            </fieldset>
+
+            <fieldset class="block">
+              <legend>LLM 提示词开头</legend>
+              <label class="field">
+                <span class="field-label">llm_judge_preamble</span>
+                <textarea id="preamble" rows="9" spellcheck="false"></textarea>
+                <span class="field-help">后面会自动接上由评分维度生成的打分标准和 JSON 输出格式。</span>
+              </label>
+            </fieldset>
+
+            <fieldset class="block">
+              <legend>Jev 总判断题 <em class="legend-note">仅 jev·noul</em></legend>
+              <label class="field">
+                <span class="field-label">instructions</span>
+                <textarea id="noulInstructions" rows="7" spellcheck="false"></textarea>
+              </label>
+              <label class="field">
+                <span class="field-label">criteria_true</span>
+                <input type="text" id="noulTrue" />
+              </label>
+              <label class="field">
+                <span class="field-label">criteria_false</span>
+                <input type="text" id="noulFalse" />
+              </label>
+            </fieldset>
+          </form>
+
+          <aside class="col preview" aria-label="预览">
+            <div class="preview-sticky">
+              <div class="section-head">
+                <h2>预览</h2>
+                <p class="section-note">按当前编辑内容实时生成，未保存也能看。</p>
+              </div>
+              <div class="weights" id="weightBar" aria-label="归一化权重"></div>
+              <div class="subtabs" role="tablist" aria-label="预览内容">
+                <button type="button" role="tab" class="subtab" data-preview="llm" aria-selected="true">LLM 系统提示词</button>
+                <button type="button" role="tab" class="subtab" data-preview="jev" aria-selected="false">Jev 题目</button>
+              </div>
+              <pre class="code-block tall" id="previewText"></pre>
+            </div>
+          </aside>
+        </div>
+        <div class="savebar" id="saveBar" hidden>
+          <span id="saveBarText">有未保存的修改</span>
+          <button type="button" class="btn btn-ghost" id="discardBtn"><span>放弃</span></button>
+          <button type="button" class="btn btn-primary" id="saveConfigBtn">保存并生效</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="./app.js?v=20260925"></script>
+</body>
+</html>

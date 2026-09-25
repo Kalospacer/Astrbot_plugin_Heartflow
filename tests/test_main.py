@@ -73,6 +73,8 @@ def _load_plugin_module():
 
     agent_message = types.ModuleType("astrbot.core.agent.message")
     agent_message.TextPart = TextPart
+    web = types.ModuleType("astrbot.api.web")
+    web.request = types.SimpleNamespace()
     api.star = star
     api.logger = _Logger()
     astrbot.api = api
@@ -87,13 +89,17 @@ def _load_plugin_module():
         "astrbot.core": types.ModuleType("astrbot.core"),
         "astrbot.core.agent": types.ModuleType("astrbot.core.agent"),
         "astrbot.core.agent.message": agent_message,
+        "astrbot.api.web": web,
     }
     previous = {name: sys.modules.get(name) for name in modules}
     sys.modules.update(modules)
     try:
-        module_path = Path(__file__).resolve().parents[1] / "main.py"
+        plugin_dir = Path(__file__).resolve().parents[1]
+        package = types.ModuleType("heartflow_test_pkg")
+        package.__path__ = [str(plugin_dir)]
+        sys.modules["heartflow_test_pkg"] = package
         spec = importlib.util.spec_from_file_location(
-            "heartflow_test_module", module_path
+            "heartflow_test_pkg.main", plugin_dir / "main.py"
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module

@@ -97,6 +97,17 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 - 整批放进 `current_messages`，不受 `judge_context_count` 限制
 - 防抖等待不占锁；判断期间持有群锁，同一个群的新消息要等判断结束才能被记录
 
+## 管理面板
+
+AstrBot WebUI → 插件 → Heartflow → 页面「管理面板」（`pages/管理面板/`，接口在 `page_api.py`）：
+
+- `01 概览`：运行状态、判断与触发计数、各群的精力 / 冷却 / 待判断 / 最近信号，可重置单个群
+- `02 判断日志`：最近 200 次判断的批次消息、信号与阈值、各维度分数、判断理由；「最近一次请求体」显示真实发出的 LLM / Jev 请求（不含 API key）
+- `03 人格`：开关人格压缩、编辑 `compressed_persona`、按指定会话的原始人格重新压缩
+- `04 判断配置`：引擎、判断模式、阈值、评分维度增删改排序、LLM 提示词开头、Jev 总判断题；编辑时实时预览提示词与归一化权重，保存后即时生效
+
+概览和判断日志每 5 秒刷新，可暂停；标签页隐藏时不刷新。
+
 ## 管理命令
 
 仅管理员可用：
@@ -133,8 +144,8 @@ AstrBot 群聊主动回复插件：判断器决定要不要插话，命中后把
 
 ```bash
 python -m unittest discover -s tests -v
-python -m ruff check main.py tests
-python -m ruff format --check main.py tests
+python -m ruff check main.py page_api.py tests
+python -m ruff format --check main.py page_api.py tests
 ```
 
 AstrBot 源码目录下的集成测试：
